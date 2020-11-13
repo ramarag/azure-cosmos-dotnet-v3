@@ -7,10 +7,12 @@ namespace Microsoft.Azure.Cosmos.Tests.Routing
     using System;
     using System.Collections.Generic;
     using System.Collections.ObjectModel;
+    using System.IO;
     using System.Linq;
     using System.Text;
     using Microsoft.Azure.Cosmos.Routing;
     using Microsoft.Azure.Documents;
+    using Microsoft.Azure.Documents.Collections;
     using Microsoft.Azure.Documents.Routing;
     using Microsoft.VisualStudio.TestTools.UnitTesting;
     using Newtonsoft.Json;
@@ -417,27 +419,27 @@ namespace Microsoft.Azure.Cosmos.Tests.Routing
         /// <summary>
         /// Tests to get distribution of data in pkranges for PartitionKeyDefinitionVersion.V2
         /// </summary>
-        //[TestMethod]
-        //public void TestPartitionKeyCardinalityForV2()
-        //{
-        //    PartitionKeyDefinition partitionKeyDefinition = new PartitionKeyDefinition();
-        //    partitionKeyDefinition.Paths.Add("/field1");
-        //    partitionKeyDefinition.Version = PartitionKeyDefinitionVersion.V2;
+        [TestMethod]
+        public void TestPartitionKeyCardinalityForV2()
+        {
+            PartitionKeyDefinition partitionKeyDefinition = new PartitionKeyDefinition();
+            partitionKeyDefinition.Paths.Add("/field1");
+            partitionKeyDefinition.Version = PartitionKeyDefinitionVersion.V2;
 
-        //    List<string> partitionKeys = new List<string>();
-        //    for (int i = 0; i < 100 * 100 * 100; i++)
-        //    {
-        //        string partitionKey = $"tentant:{Guid.NewGuid().ToString()}:id";
-        //        partitionKeys.Add(partitionKey);
-        //    }
+            List<string> partitionKeys = new List<string>();
+            for (int i = 0; i < 100 * 100 * 100; i++)
+            {
+                string partitionKey = $"tentant:{Guid.NewGuid().ToString()}:id";
+                partitionKeys.Add(partitionKey);
+            }
 
-        //    Dictionary<int, List<string>> buckets = PartitionKeyInternalTest.GetDocumentDistribution(partitionKeyDefinition, 10, partitionKeys);
+            Dictionary<int, List<string>> buckets = PartitionKeyInternalTest.GetDocumentDistribution(partitionKeyDefinition, 10, partitionKeys);
 
-        //    foreach (List<string> addedPartitionKeys in buckets.Values)
-        //    {
-        //        Assert.IsTrue(addedPartitionKeys.Count > 0);
-        //    }
-        //}
+            foreach (List<string> addedPartitionKeys in buckets.Values)
+            {
+                Assert.IsTrue(addedPartitionKeys.Count > 0);
+            }
+        }
 
         /// <summary>
         /// Tests to get distribution of data in pkranges for PartitionKeyDefinitionVersion.V1
@@ -449,36 +451,28 @@ namespace Microsoft.Azure.Cosmos.Tests.Routing
             partitionKeyDefinition.Paths.Add("/field1");
             partitionKeyDefinition.Version = PartitionKeyDefinitionVersion.V1;
 
-            List<object> partitionKeys = new List<object>() { 250037336370, 250004204221,
-250037336370,
-250031686465,
-250030016700,
-250031686465,
-250006422618,
-250030016700,
-50021128547,
-250006422618,
-250029312109};
-            //for (int i = 0; i < 100 * 100 * 100; i++)
-            //{
-            //    string partitionKey = $"tentant:{Guid.NewGuid().ToString()}:id";
-            //    partitionKeys.Add(partitionKey);
-            ////}
+            List<ulong> partitionKeys = new List<ulong> { };
 
-            Dictionary<int, List<object>> buckets = PartitionKeyInternalTest.GetDocumentDistribution(partitionKeyDefinition, 50, partitionKeys);
+            foreach (string key in File.ReadAllLines(@"C:\Users\ramarag\Downloads\hhidlist.txt"))
+            {
+                ulong value = ulong.Parse(key);
+                partitionKeys.Add(value);
+            }
 
-            foreach (List<object> addedPartitionKeys in buckets.Values)
+            Dictionary<int, List<ulong>> buckets = PartitionKeyInternalTest.GetDocumentDistribution(partitionKeyDefinition, 50, partitionKeys);
+
+            foreach (List<ulong> addedPartitionKeys in buckets.Values)
             {
                 Assert.IsTrue(addedPartitionKeys.Count > 0);
             }
         }
 
-        internal static Dictionary<int, List<object>> GetDocumentDistribution(
+        internal static Dictionary<int, List<T>> GetDocumentDistribution<T>(
             PartitionKeyDefinition partitionKeyDefinition,
             int PartitionCount,
-            IEnumerable<object> partitonKeys)
+            IEnumerable<T> partitonKeys)
         {
-            Dictionary<int, List<object>> bucket = new Dictionary<int, List<object>>();
+            Dictionary<int, List<T>> bucket = new Dictionary<int, List<T>>();
 
             List<PartitionKeyRange> ranges = new List<PartitionKeyRange>();
             for ( int i = 0; i < PartitionCount; i++)
@@ -499,14 +493,14 @@ namespace Microsoft.Azure.Cosmos.Tests.Routing
                     string.Empty,
                     null);
 
-            foreach(object partitionKey in partitonKeys)
+            foreach(T partitionKey in partitonKeys)
             {
                 PartitionKeyInternal partitionKeyValue = PartitionKeyInternal.FromObjectArray(new object[] { partitionKey }, true);
                 string effectivePartitionKey = partitionKeyValue.GetEffectivePartitionKeyString(partitionKeyDefinition);
                 string partitionRangeId = collectionRoutingMap.GetRangeByEffectivePartitionKey(effectivePartitionKey).Id;
 
                 int pkRangeId = int.Parse(partitionRangeId);
-                List<object> addedPartitionKeys;
+                List<T> addedPartitionKeys;
 
                 if (bucket.TryGetValue(pkRangeId, out addedPartitionKeys))
                 {
@@ -514,7 +508,7 @@ namespace Microsoft.Azure.Cosmos.Tests.Routing
                 }
                 else
                 {
-                    addedPartitionKeys = new List<object>() { partitionKey };
+                    addedPartitionKeys = new List<T>() { partitionKey };
                     bucket.Add(pkRangeId, addedPartitionKeys);
                 }
             }
