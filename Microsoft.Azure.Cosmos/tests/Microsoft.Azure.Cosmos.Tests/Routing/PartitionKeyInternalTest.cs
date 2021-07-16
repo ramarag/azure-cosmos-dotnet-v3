@@ -449,19 +449,19 @@ namespace Microsoft.Azure.Cosmos.Tests.Routing
         {
             PartitionKeyDefinition partitionKeyDefinition = new PartitionKeyDefinition();
             partitionKeyDefinition.Paths.Add("/field1");
-            partitionKeyDefinition.Version = PartitionKeyDefinitionVersion.V1;
+            partitionKeyDefinition.Version = PartitionKeyDefinitionVersion.V2;
 
-            List<ulong> partitionKeys = new List<ulong> { };
+            List<string> partitionKeys = new List<string> { };
 
-            foreach (string key in File.ReadAllLines(@"C:\Users\ramarag\Downloads\hhidlist.txt"))
+            foreach (string key in File.ReadAllLines(@"C:\Users\ramarag\Downloads\BATCH2.txt"))
             {
-                ulong value = ulong.Parse(key);
-                partitionKeys.Add(value);
+               // ulong value = ulong.Parse(key);
+                partitionKeys.Add(key);
             }
 
-            Dictionary<int, List<ulong>> buckets = PartitionKeyInternalTest.GetDocumentDistribution(partitionKeyDefinition, 50, partitionKeys);
+            Dictionary<int, List<string>> buckets = PartitionKeyInternalTest.GetDocumentDistribution(partitionKeyDefinition, 10, partitionKeys);
 
-            foreach (List<ulong> addedPartitionKeys in buckets.Values)
+            foreach (List<string> addedPartitionKeys in buckets.Values)
             {
                 Assert.IsTrue(addedPartitionKeys.Count > 0);
             }
