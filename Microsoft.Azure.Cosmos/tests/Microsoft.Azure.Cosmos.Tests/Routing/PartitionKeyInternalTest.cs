@@ -449,11 +449,13 @@ namespace Microsoft.Azure.Cosmos.Tests.Routing
             partitionKeyDefinition.Version = PartitionKeyDefinitionVersion.V1;
 
             List<string> partitionKeys = new List<string>();
-            for (int i = 0; i < 100 * 100 * 100; i++)
-            {
-                string partitionKey = $"tentant:{Guid.NewGuid()}:id";
-                partitionKeys.Add(partitionKey);
-            }
+            string partitionKey = $"6271CE235C224390B98B654877330558";
+            partitionKeys.Add(partitionKey);
+            //for (int i = 0; i < 100 * 100 * 100; i++)
+            //{
+            //    string partitionKey = $"tentant:{Guid.NewGuid()}:id";
+            //    partitionKeys.Add(partitionKey);
+            //}
 
             Dictionary<int, List<string>> buckets = PartitionKeyInternalTest.GetDocumentDistribution(partitionKeyDefinition, 10, partitionKeys);
 
@@ -471,16 +473,48 @@ namespace Microsoft.Azure.Cosmos.Tests.Routing
             Dictionary<int, List<string>> bucket = new Dictionary<int, List<string>>();
 
             List<PartitionKeyRange> ranges = new List<PartitionKeyRange>();
-            for ( int i = 0; i < PartitionCount; i++)
+
+            PartitionKeyRange partitionKeyRange1 = new PartitionKeyRange()
             {
-                PartitionKeyRange partitionKeyRange = new PartitionKeyRange()
-                {
-                    Id = i.ToString(),
-                    MinInclusive = PartitionKeyInternal.GetMinInclusiveEffectivePartitionKey(i, PartitionCount, partitionKeyDefinition),
-                    MaxExclusive = PartitionKeyInternal.GetMaxExclusiveEffectivePartitionKey(i, PartitionCount, partitionKeyDefinition)
-                };
-                ranges.Add(partitionKeyRange);
-            }
+                Id = "0",
+                MinInclusive = "",
+                MaxExclusive = "05C1CD59B1F718"
+            };
+            ranges.Add(partitionKeyRange1);
+
+            PartitionKeyRange partitionKeyRange2 = new PartitionKeyRange()
+            {
+                Id = "1",
+                MinInclusive = "05C1CD59B1F718",
+                MaxExclusive = "05C1CD6F0D8128"
+            };
+            ranges.Add(partitionKeyRange2);
+
+            PartitionKeyRange partitionKeyRange21 = new PartitionKeyRange()
+            {
+                Id = "11",
+                MinInclusive = "05C1CD6F0D8128",
+                MaxExclusive = "05C1CD7F59D978"
+            };
+            ranges.Add(partitionKeyRange21);
+
+            PartitionKeyRange partitionKeyRange3 = new PartitionKeyRange()
+            {
+                Id = "2",
+                MinInclusive = "05C1CD7F59D978",
+                MaxExclusive = "FF"
+            };
+            ranges.Add(partitionKeyRange3);
+            //for ( int i = 0; i < PartitionCount; i++)
+            //{
+            //    PartitionKeyRange partitionKeyRange = new PartitionKeyRange()
+            //    {
+            //        Id = i.ToString(),
+            //        MinInclusive = PartitionKeyInternal.GetMinInclusiveEffectivePartitionKey(i, PartitionCount, partitionKeyDefinition),
+            //        MaxExclusive = PartitionKeyInternal.GetMaxExclusiveEffectivePartitionKey(i, PartitionCount, partitionKeyDefinition)
+            //    };
+            //    ranges.Add(partitionKeyRange);
+            //}
 
             IEnumerable<Tuple<PartitionKeyRange, ServiceIdentity>> tuples = ranges.Select(range => Tuple.Create(range, (ServiceIdentity)null));
 
