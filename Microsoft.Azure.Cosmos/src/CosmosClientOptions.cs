@@ -11,9 +11,9 @@ namespace Microsoft.Azure.Cosmos
     using System.Linq;
     using System.Net;
     using System.Net.Http;
-    using System.Net.Http.Headers;
     using System.Net.Security;
     using System.Security.Cryptography.X509Certificates;
+    using Microsoft.Azure.Cosmos.FaultInjection;
     using Microsoft.Azure.Cosmos.Fluent;
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Client;
@@ -52,6 +52,7 @@ namespace Microsoft.Azure.Cosmos
 
         private const string ConnectionStringAccountEndpoint = "AccountEndpoint";
         private const string ConnectionStringAccountKey = "AccountKey";
+        private const string ConnectionStringDisableServerCertificateValidation = "DisableServerCertificateValidation";
 
         private const ApiType DefaultApiType = ApiType.None;
 
@@ -61,6 +62,7 @@ namespace Microsoft.Azure.Cosmos
         private int gatewayModeMaxConnectionLimit;
         private CosmosSerializationOptions serializerOptions;
         private CosmosSerializer serializerInternal;
+        private System.Text.Json.JsonSerializerOptions stjSerializerOptions;
 
         private ConnectionMode connectionMode;
         private Protocol connectionProtocol;
@@ -72,6 +74,8 @@ namespace Microsoft.Azure.Cosmos
         private IWebProxy webProxy;
         private Func<HttpClient> httpClientFactory;
         private string applicationName;
+        private IFaultInjector faultInjector;
+        private bool isCustomSerializerProvided;
 
         /// <summary>
         /// Creates a new CosmosClientOptions
@@ -85,6 +89,8 @@ namespace Microsoft.Azure.Cosmos
             this.ConnectionProtocol = CosmosClientOptions.DefaultProtocol;
             this.ApiType = CosmosClientOptions.DefaultApiType;
             this.CustomHandlers = new Collection<RequestHandler>();
+            this.CosmosClientTelemetryOptions = new CosmosClientTelemetryOptions();
+            this.SessionRetryOptions = new SessionRetryOptions();
         }
 
         /// <summary>
@@ -116,6 +122,11 @@ namespace Microsoft.Azure.Cosmos
         /// Get or set session container for the client
         /// </summary>
         internal ISessionContainer SessionContainer { get; set; }
+        
+        /// <summary>
+        /// hint which guide SDK-internal retry policies on how early to switch retries to a different region. 
+        /// </summary>
+        internal SessionRetryOptions SessionRetryOptions { get; private set; }
 
         /// <summary>
         /// Gets or sets the location where the application is running. This will influence the SDK's choice for the Azure Cosmos DB service interaction.
@@ -163,7 +174,7 @@ namespace Microsoft.Azure.Cosmos
         /// <para>
         /// During the CosmosClient initialization the account information, including the available regions, is obtained from the <see cref="CosmosClient.Endpoint"/>.
         /// The CosmosClient will use the value of <see cref="ApplicationPreferredRegions"/> to populate the preferred list with the account available regions that intersect with its value.
-        /// If the value of <see cref="ApplicationPreferredRegions"/> contains regions that are not an available region in the account, the values will be ignored. If the these invalid regions are added later to the account, the CosmosClient will use them if they are higher in the preference order.
+        /// If the value of <see cref="ApplicationPreferredRegions"/> contains regions that are not an available region in the account, the values will be ignored. If these invalid regions are added later to the account, the CosmosClient will use them if they are higher in the preference order.
         /// </para>
         /// <para>
         /// If during CosmosClient initialization, the <see cref="CosmosClient.Endpoint"/> is not reachable, the CosmosClient will attempt to recover and obtain the account information issuing requests to the regions in <see cref="ApplicationPreferredRegions"/> in the order that they are listed.
@@ -192,12 +203,91 @@ namespace Microsoft.Azure.Cosmos
         public IReadOnlyList<string> ApplicationPreferredRegions { get; set; }
 
         /// <summary>
+        /// Gets and sets the custom endpoints to use for account initialization for geo-replicated database accounts in the Azure Cosmos DB service. 
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// During the CosmosClient initialization the account information, including the available regions, is obtained from the <see cref="CosmosClient.Endpoint"/>.
+        /// Should the global endpoint become inaccessible, the CosmosClient will attempt to obtain the account information issuing requests to the custom endpoints provided in <see cref="AccountInitializationCustomEndpoints"/>.
+        /// </para>
+        /// <para>
+        /// Nevertheless, this parameter remains optional and is recommended for implementation when a customer has configured an endpoint with a custom DNS hostname
+        /// (instead of accountname-region.documents.azure.com) etc. for their Cosmos DB account.
+        /// </para>
+        /// <para>
+        /// See also <seealso href="https://docs.microsoft.com/azure/cosmos-db/sql/troubleshoot-sdk-availability">Diagnose
+        /// and troubleshoot the availability of Cosmos SDKs</seealso> for more details.
+        /// </para>
+        /// </remarks>
+        /// <example>
+        /// <code language="c#">
+        /// <![CDATA[
+        /// CosmosClientOptions clientOptions = new CosmosClientOptions()
+        /// {
+        ///     AccountInitializationCustomEndpoints = new HashSet<Uri>()
+        ///     { 
+        ///         new Uri("custom.p-1.documents.azure.com"),
+        ///         new Uri("custom.p-2.documents.azure.com") 
+        ///     }
+        /// };
+        /// 
+        /// CosmosClient client = new CosmosClient("endpoint", "key", clientOptions);
+        /// ]]>
+        /// </code>
+        /// </example>
+        /// <seealso href="https://docs.microsoft.com/azure/cosmos-db/high-availability#high-availability-with-cosmos-db-in-the-event-of-regional-outages">High availability on regional outages</seealso>
+        public IEnumerable<Uri> AccountInitializationCustomEndpoints { get; set; }
+
+        /// <summary>
         /// Get or set the maximum number of concurrent connections allowed for the target
         /// service endpoint in the Azure Cosmos DB service.
         /// </summary>
         /// <remarks>
         /// This setting is only applicable in Gateway mode.
+        /// The SDK sets the following on the underlying SocketsHttpHandler:
+        /// <list type="bullet">
+        /// <item><description>EnableMultipleHttp2Connections = true — allows additional HTTP/2 TCP connections
+        /// to be opened when the maximum concurrent streams limit on an existing connection is reached.</description></item>
+        /// <item><description>KeepAlivePingDelay = 1 second — sends HTTP/2 PING frames after 1 second
+        /// of inactivity to detect broken connections in the pool.</description></item>
+        /// <item><description>KeepAlivePingTimeout = 2 seconds — marks a connection as dead if no PONG
+        /// response is received within 2 seconds.</description></item>
+        /// <item><description>KeepAlivePingPolicy = Always — sends pings even for idle connections, which
+        /// is critical for detecting broken connections that remain in the pool.</description></item>
+        /// </list>
+        /// This property controls the upper bound on the total number of connections per server endpoint.
+        /// When using a custom <see cref="HttpClientFactory"/>, configure these properties
+        /// directly on your SocketsHttpHandler for equivalent behavior.
         /// </remarks>
+        /// <example>
+        /// Using the SDK-managed handler with a custom connection limit:
+        /// <code language="c#">
+        /// <![CDATA[
+        /// CosmosClientOptions options = new CosmosClientOptions()
+        /// {
+        ///     ConnectionMode = ConnectionMode.Gateway,
+        ///     GatewayModeMaxConnectionLimit = 100
+        /// };
+        /// ]]>
+        /// </code>
+        /// When providing a custom HttpClientFactory, set the properties on SocketsHttpHandler directly:
+        /// <code language="c#">
+        /// <![CDATA[
+        /// SocketsHttpHandler handler = new SocketsHttpHandler
+        /// {
+        ///     MaxConnectionsPerServer = 100,
+        ///     EnableMultipleHttp2Connections = true,
+        ///     KeepAlivePingDelay = TimeSpan.FromSeconds(1),
+        ///     KeepAlivePingTimeout = TimeSpan.FromSeconds(2),
+        ///     KeepAlivePingPolicy = HttpKeepAlivePingPolicy.Always
+        /// };
+        /// CosmosClientOptions options = new CosmosClientOptions()
+        /// {
+        ///     HttpClientFactory = () => new HttpClient(handler, disposeHandler: false)
+        /// };
+        /// ]]>
+        /// </code>
+        /// </example>
         /// <value>Default value is 50.</value>
         /// <seealso cref="CosmosClientBuilder.WithConnectionModeGateway(int?, IWebProxy)"/>
         public int GatewayModeMaxConnectionLimit
@@ -223,9 +313,27 @@ namespace Microsoft.Azure.Cosmos
         /// Gets the request timeout in seconds when connecting to the Azure Cosmos DB service.
         /// The number specifies the time to wait for response to come back from network peer.
         /// </summary>
-        /// <value>Default value is 1 minute.</value>
+        /// <value>Default value is 6 seconds.</value>
         /// <seealso cref="CosmosClientBuilder.WithRequestTimeout(TimeSpan)"/>
         public TimeSpan RequestTimeout { get; set; }
+
+        /// <summary>
+        /// Gets or sets the request timeout for inference service operations (e.g., semantic reranking).
+        /// The number specifies the time to wait for a response from the inference service before the request is cancelled.
+        /// This is a single-attempt timeout with no retries.
+        /// </summary>
+        /// <value>Default value is 5 seconds.</value>
+        /// <remarks>
+        /// This timeout is specific to inference service operations and is separate from the standard <see cref="RequestTimeout"/>.
+        /// If the request does not complete within the specified duration, a <see cref="CosmosException"/> with status 408 (Request Timeout) is thrown.
+        /// No retries are attempted on timeout.
+        /// </remarks>
+#if PREVIEW
+        public
+#else
+        internal
+#endif
+        TimeSpan InferenceRequestTimeout { get; set; } = InferenceService.DefaultInferenceRequestTimeout;
 
         /// <summary>
         /// The SDK does a background refresh based on the time interval set to refresh the token credentials.
@@ -250,7 +358,7 @@ namespace Microsoft.Azure.Cosmos
         /// Default value is <see cref="Cosmos.ConnectionMode.Direct"/>
         /// </value>
         /// <remarks>
-        /// For more information, see <see href="https://docs.microsoft.com/azure/documentdb/documentdb-performance-tips#direct-connection">Connection policy: Use direct connection mode</see>.
+        /// For more information, see <see href="https://learn.microsoft.com/azure/cosmos-db/nosql/performance-tips-dotnet-sdk-v3#direct-connection">Connection policy: Use direct connection mode</see>.
         /// </remarks>
         /// <seealso cref="CosmosClientBuilder.WithConnectionModeDirect()"/>
         /// <seealso cref="CosmosClientBuilder.WithConnectionModeGateway(int?, IWebProxy)"/>
@@ -278,6 +386,34 @@ namespace Microsoft.Azure.Cosmos
         /// If this is not set the database account consistency level will be used for all requests.
         /// </summary>
         public ConsistencyLevel? ConsistencyLevel { get; set; }
+
+        /// <summary>
+        /// Gets or sets the <see cref="ReadConsistencyStrategy"/> to be used for read operations.
+        /// </summary>
+        /// <remarks>
+        /// When set, this takes precedence over <see cref="ConsistencyLevel"/> for read and query operations.
+        /// If also set at request level (e.g., in <see cref="ItemRequestOptions.ReadConsistencyStrategy"/>),
+        /// the request-level value is used.
+        /// <para>
+        /// <see cref="ReadConsistencyStrategy.GlobalStrong"/> is only valid for accounts configured with Strong consistency.
+        /// </para>
+        /// </remarks>
+#if PREVIEW
+        public
+#else
+        internal
+#endif
+        ReadConsistencyStrategy? ReadConsistencyStrategy { get; set; }
+
+        /// <summary>
+        /// Sets the priority level for requests created using cosmos client.
+        /// </summary>
+        /// <remarks>
+        /// If priority level is also set at request level in <see cref="RequestOptions.PriorityLevel"/>, that priority is used.
+        /// If <see cref="AllowBulkExecution"/> is set to true in CosmosClientOptions, priority level set on the CosmosClient is used.
+        /// </remarks>
+        /// <seealso href="https://aka.ms/CosmosDB/PriorityBasedExecution"/>
+        public PriorityLevel? PriorityLevel { get; set; }
 
         /// <summary>
         /// Gets or sets the maximum number of retries in the case where the request fails
@@ -347,6 +483,90 @@ namespace Microsoft.Azure.Cosmos
         public bool? EnableContentResponseOnWrite { get; set; }
 
         /// <summary>
+        /// Sets the <see cref="System.Text.Json.JsonSerializerOptions"/> for the System.Text.Json serializer.
+        /// Note that if this option is provided, then the SDK will use the System.Text.Json as the default serializer and set
+        /// the serializer options as the constructor args.
+        /// </summary>
+        /// <example>
+        /// An example on how to configure the System.Text.Json serializer options to ignore null values
+        /// <code language="c#">
+        /// <![CDATA[
+        /// CosmosClientOptions clientOptions = new CosmosClientOptions()
+        /// {
+        ///     UseSystemTextJsonSerializerWithOptions = new System.Text.Json.JsonSerializerOptions()
+        ///     {
+        ///         DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
+        ///     }
+        /// };
+        /// 
+        /// CosmosClient client = new CosmosClient("endpoint", "key", clientOptions);
+        /// ]]>
+        /// </code>
+        /// </example>
+        [JsonConverter(typeof(ClientOptionJsonConverter))]
+        public System.Text.Json.JsonSerializerOptions UseSystemTextJsonSerializerWithOptions
+        {
+            get => this.stjSerializerOptions;
+            set
+            {
+                if (this.Serializer != null || this.SerializerOptions != null)
+                {
+                    throw new ArgumentException(
+                        $"{nameof(this.UseSystemTextJsonSerializerWithOptions)} is not compatible with {nameof(this.Serializer)} or {nameof(this.SerializerOptions)}. Only one can be set.  ");
+                }
+
+                this.stjSerializerOptions = value;
+                this.serializerInternal = new CosmosSystemTextJsonSerializer(
+                    this.stjSerializerOptions);
+            }
+        }
+
+        /// <summary>
+        /// Gets or sets the advanced replica selection flag. The advanced replica selection logic keeps track of the replica connection
+        /// status, and based on status, it prioritizes the replicas which show healthy stable connections, so that the requests can be sent
+        /// confidently to the particular replica. This helps the cosmos client to become more resilient and effective to any connectivity issues.
+        /// The default value for this parameter is 'false'.
+        /// </summary>
+        /// <remarks>
+        /// <para>This is optimal for latency-sensitive workloads. Does not apply if <see cref="ConnectionMode.Gateway"/> is used.</para>
+        /// </remarks>
+        internal bool? EnableAdvancedReplicaSelectionForTcp { get; set; }
+
+        /// <summary>
+        /// Gets or sets stack trace optimization to reduce stack trace proliferation in high-concurrency scenarios where exceptions are frequently thrown. 
+        /// When enabled, critical SDK components optimize exception handling to minimize performance overhead.
+        /// The default value is 'true'.
+        /// </summary>
+        internal bool EnableAsyncCacheExceptionNoSharing { get; set; } = true;
+
+        /// <summary>
+        /// Gets or sets the boolean flag to skip converting a text stream to binary and vice versa. When enabled, the request and response stream
+        /// would not be converted to the desired target serialization type and will act just like a pass through. This client option will
+        /// remain internal only since the consumer of this flag will be the internal components of the cosmos db ecosystem.
+        /// The default value for this parameter is 'false'.
+        /// </summary>
+        internal bool EnableStreamPassThrough { get; set; } = false;
+
+        /// <summary>
+        /// Gets or sets a value indicating whether to use length-aware range comparators for EPK range comparisons.
+        /// Length-aware range comparators were introduced in Range class to handle EPK range comparisons correctly 
+        /// in the case of a container's physical partition set consisting of fully and partially specified EPK values.
+        /// By default, length-aware range comparator is enabled. Refer to Range.cs in Msdata project for more details. 
+        /// Range.LengthAwareMinComparer/LengthAwareMaxComparer.
+        /// Setting the value to false will disable length-aware range comparator and switch to using the regular 
+        /// Range.MinComparer/MaxComparer.
+        /// </summary>
+        /// <value>
+        /// The default value is true.
+        /// </value>
+        internal bool UseLengthAwareRangeComparer { get; set; } =
+#if !INTERNAL
+            true;
+#else
+            false;
+#endif
+
+        /// <summary>
         /// (Direct/TCP) Controls the amount of idle time after which unused connections are closed.
         /// </summary>
         /// <value>
@@ -369,7 +589,7 @@ namespace Microsoft.Azure.Cosmos
         /// (Direct/TCP) Controls the amount of time allowed for trying to establish a connection.
         /// </summary>
         /// <value>
-        /// The default timeout is 5 seconds. Recommended values are greater than or equal to 5 seconds.
+        /// The default timeout is 5 seconds. For latency sensitive applications that prefer to retry faster, a recommended value of 1 second can be used.
         /// </value>
         /// <remarks>
         /// When the time elapses, the attempt is cancelled and an error is returned. Longer timeouts will delay retries and failures.
@@ -485,10 +705,10 @@ namespace Microsoft.Azure.Cosmos
             get => this.serializerOptions;
             set
             {
-                if (this.Serializer != null)
+                if (this.Serializer != null || this.UseSystemTextJsonSerializerWithOptions != null)
                 {
                     throw new ArgumentException(
-                        $"{nameof(this.SerializerOptions)} is not compatible with {nameof(this.Serializer)}. Only one can be set.  ");
+                        $"{nameof(this.SerializerOptions)} is not compatible with {nameof(this.Serializer)} or {nameof(this.UseSystemTextJsonSerializerWithOptions)}. Only one can be set.  ");
                 }
 
                 this.serializerOptions = value;
@@ -520,12 +740,13 @@ namespace Microsoft.Azure.Cosmos
             get => this.serializerInternal;
             set
             {
-                if (this.SerializerOptions != null)
+                if (this.SerializerOptions != null || this.UseSystemTextJsonSerializerWithOptions != null)
                 {
                     throw new ArgumentException(
-                        $"{nameof(this.Serializer)} is not compatible with {nameof(this.SerializerOptions)}. Only one can be set.  ");
+                        $"{nameof(this.Serializer)} is not compatible with {nameof(this.SerializerOptions)} or {nameof(this.UseSystemTextJsonSerializerWithOptions)}. Only one can be set.  ");
                 }
 
+                this.isCustomSerializerProvided = true;
                 this.serializerInternal = value;
             }
         }
@@ -546,6 +767,9 @@ namespace Microsoft.Azure.Cosmos
 
         /// <summary>
         /// Allows optimistic batching of requests to service. Setting this option might impact the latency of the operations. Hence this option is recommended for non-latency sensitive scenarios only.
+        /// <remarks>
+        /// The use of Resource Tokens scoped to a Partition Key as an authentication mechanism when Bulk is enabled is not recommended as it reduces the potential throughput benefit
+        /// </remarks>
         /// </summary>
         public bool AllowBulkExecution { get; set; }
 
@@ -595,15 +819,71 @@ namespace Microsoft.Azure.Cosmos
         }
 
         /// <summary>
-        /// Enable partition key level failover
+        /// Availability Strategy to be used for periods of high latency
         /// </summary>
-        internal bool EnablePartitionLevelFailover { get; set; } = false;
+        /// /// <example>
+        /// An example on how to set an availability strategy custom serializer.
+        /// <code language="c#">
+        /// <![CDATA[
+        /// CosmosClient client = new CosmosClientBuilder("connection string")
+        /// .WithApplicationPreferredRegions(
+        ///    new List<string> { "East US", "Central US", "West US" } )
+        /// .WithAvailabilityStrategy(
+        ///    AvailabilityStrategy.CrossRegionHedgingStrategy(
+        ///    threshold: TimeSpan.FromMilliseconds(500),
+        ///    thresholdStep: TimeSpan.FromMilliseconds(100)
+        /// ))
+        /// .Build();
+        /// ]]>
+        /// </code>
+        /// </example>
+        /// <remarks> 
+        /// The availability strategy in the example is a Cross Region Hedging Strategy.
+        /// These strategies take two values, a threshold and a threshold step.When a request that is sent 
+        /// out takes longer than the threshold time, the SDK will hedge to the second region in the application preferred regions list.
+        /// If a response from either the primary request or the first hedged request is not received 
+        /// after the threshold step time, the SDK will hedge to the third region and so on.
+        /// </remarks>
+        public AvailabilityStrategy AvailabilityStrategy { get; set; }
+
+        /// <summary>
+        /// Provides SessionTokenMismatchRetryPolicy optimization through customer supplied region switch hints,
+        /// which guide SDK-internal retry policies on how early to fallback to the next applicable region.
+        /// With a single-write-region account the next applicable region is the write-region, with a 
+        /// multi-write-region account the next applicable region is the next region in the order of effective 
+        /// preferred regions (same order also used for read/query operations).
+        /// </summary>
+#if PREVIEW
+        public
+#else
+        internal
+#endif
+        bool EnableRemoteRegionPreferredForSessionRetry
+        {
+            get => this.SessionRetryOptions.RemoteRegionPreferred;
+            set => this.SessionRetryOptions.RemoteRegionPreferred = value;
+        }
+
+        /// <summary>
+        /// Enable partition level circuit breaker (aka PPCB). For compute gateway use case, by default per partition automatic failover will be disabled, so does the PPCB.
+        /// If compute gateway chooses to enable PPAF, then the .NET SDK will enable PPCB by default, which will improve the read availability and latency. This would mean
+        /// when PPAF is enabled, the SDK will automatically enable PPCB as well.
+        /// </summary>
+        internal bool EnablePartitionLevelCircuitBreaker { get; set; } = ConfigurationManager.IsPartitionLevelCircuitBreakerEnabled(defaultValue: false);
+
+        /// <summary>
+        /// Flag from gateway to disable partition level failover. Normally, the SDK will enable partition level failover based on the account settings. 
+        /// This flag will be used internally by the compute gateway as by default it will disable partition level failover.
+        /// 
+        /// The default value for this parameter is 'false'.
+        /// </summary>
+        internal bool DisablePartitionLevelFailover { get; set; } = false;
 
         /// <summary>
         /// Quorum Read allowed with eventual consistency account or consistent prefix account.
         /// </summary>
         internal bool EnableUpgradeConsistencyToLocalQuorum { get; set; } = false;
-        
+
         /// <summary>
         /// Gets or sets the connection protocol when connecting to the Azure Cosmos service.
         /// </summary>
@@ -613,7 +893,7 @@ namespace Microsoft.Azure.Cosmos
         /// <remarks>
         /// This setting is not used when <see cref="ConnectionMode"/> is set to <see cref="Cosmos.ConnectionMode.Gateway"/>.
         /// Gateway mode only supports HTTPS.
-        /// For more information, see <see href="https://docs.microsoft.com/azure/documentdb/documentdb-performance-tips#use-tcp">Connection policy: Use the TCP protocol</see>.
+        /// For more information, see <see href="https://learn.microsoft.com/azure/cosmos-db/nosql/performance-tips-dotnet-sdk-v3#networking">Connection policy: Use the HTTPS protocol</see>.
         /// </remarks>
         internal Protocol ConnectionProtocol
         {
@@ -640,11 +920,48 @@ namespace Microsoft.Azure.Cosmos
         /// </summary>
         /// <remarks>
         /// <para>
-        /// Customizing SSL verification is not recommended in production environments.
+        /// Emulator: To ignore SSL Certificate please suffix connectionstring with "DisableServerCertificateValidation=True;". 
+        /// When CosmosClientOptions.HttpClientFactory is used, SSL certificate needs to be handled appropriately.
+        /// NOTE: DO NOT use the `DisableServerCertificateValidation` flag in production (only for emulator)
         /// </para>
         /// </remarks>
         public Func<X509Certificate2, X509Chain, SslPolicyErrors, bool> ServerCertificateCustomValidationCallback { get; set; }
-       
+
+        /// <summary>
+        /// Real call back that will be hooked down-stream to the transport clients (both http and tcp).
+        /// NOTE: All down stream real-usage should come through this API only and not through the public API.
+        /// 
+        /// Test hook DisableServerCertificateValidationInvocationCallback 
+        /// - When configured will invoke it when ever custom validation is done
+        /// </summary>
+        internal Func<X509Certificate2, X509Chain, SslPolicyErrors, bool> GetServerCertificateCustomValidationCallback()
+        {
+            if (this.DisableServerCertificateValidation)
+            {
+                if (this.DisableServerCertificateValidationInvocationCallback == null)
+                {
+                    return this.ServerCertificateCustomValidationCallback ?? ((_, _, _) => true);
+                }
+                else
+                {
+                    return (X509Certificate2 cert, X509Chain chain, SslPolicyErrors policyErrors) =>
+                    {
+                        bool bValidationResult = true;
+                        if (this.ServerCertificateCustomValidationCallback != null)
+                        {
+                            bValidationResult = this.ServerCertificateCustomValidationCallback(cert, chain, policyErrors);
+                        }
+                        this.DisableServerCertificateValidationInvocationCallback?.Invoke();
+                        return bValidationResult;
+                    };
+                }
+            }
+
+            return this.ServerCertificateCustomValidationCallback;
+        }
+
+        internal Action DisableServerCertificateValidationInvocationCallback { get; set; }
+
         /// <summary>
         /// API type for the account
         /// </summary>
@@ -719,9 +1036,71 @@ namespace Microsoft.Azure.Cosmos
         internal bool? EnableCpuMonitor { get; set; }
 
         /// <summary>
-        /// Flag to enable telemetry
+        /// Flag indicates the value of DisableServerCertificateValidation flag set at connection string level.Default it is false.
         /// </summary>
-        internal bool? EnableClientTelemetry { get; set; }
+        internal bool DisableServerCertificateValidation { get; set; }
+
+        /// <summary>
+        /// Gets or sets Client Telemetry Options like feature flags and corresponding options
+        /// </summary>
+        public CosmosClientTelemetryOptions CosmosClientTelemetryOptions { get; set; }
+
+        /// <summary>
+        /// Create a client with Fault Injection capabilities using the Cosmos DB Fault Injection Library.
+        /// </summary>
+        /// <example>
+        /// How to create a CosmosClient with Fault Injection capabilities.
+        /// <code language="c#">
+        /// <![CDATA[
+        /// FaultInjectionRule rule = new FaultInjectionRuleBuilder(
+        ///     id: "ruleId",
+        ///     condition: new FaultInjectionConditionBuilder()
+        ///         .WithRegion("East US")
+        ///         .Build(),
+        ///     result: new FaultInjectionResultBuilder.GetResultBuilder(FaultInjectionServerErrorType.ServiceUnavailable)
+        ///         .Build())
+        ///     .Build();
+        ///     
+        /// FaultInjector faultInjector = new FaultInjector(new List<FaultInjectionRule>() { rule });
+        /// 
+        /// CosmosClientOptions clientOptions = new CosmosClientOptions()
+        /// {
+        ///     FaultInjector = faultInjector
+        /// };
+        /// 
+        /// CosmosClient client = new CosmosClient("connection string", clientOptions);
+        /// ]]>
+        /// </code>
+        /// </example> 
+        public IFaultInjector FaultInjector
+        {
+            get => this.faultInjector;
+            set
+            {
+                this.faultInjector = value;
+                if (this.faultInjector != null)
+                {
+                    this.ChaosInterceptorFactory = this.faultInjector.GetChaosInterceptorFactory();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Sets the throughput bucket for requests created using cosmos client.
+        /// </summary>
+        /// <remarks>
+        /// If throughput bucket is also set at request level in <see cref="RequestOptions.ThroughputBucket"/>, that throughput bucket is used.
+        /// If <see cref="AllowBulkExecution"/> is set to true in CosmosClientOptions, throughput bucket can only be set at client level.
+        /// </remarks>
+        /// <seealso href="https://aka.ms/cosmsodb-bucketing"/>
+#if PREVIEW
+        public
+#else
+        internal
+#endif
+        int? ThroughputBucket { get; set; }
+
+        internal IChaosInterceptorFactory ChaosInterceptorFactory { get; set; }
 
         internal void SetSerializerIfNotConfigured(CosmosSerializer serializer)
         {
@@ -744,6 +1123,7 @@ namespace Microsoft.Azure.Cosmos
 
             ConnectionPolicy connectionPolicy = new ConnectionPolicy()
             {
+                ApplicationName = this.ApplicationName,
                 MaxConnectionLimit = this.GatewayModeMaxConnectionLimit,
                 RequestTimeout = this.RequestTimeout,
                 ConnectionMode = this.ConnectionMode,
@@ -751,30 +1131,43 @@ namespace Microsoft.Azure.Cosmos
                 UserAgentContainer = this.CreateUserAgentContainerWithFeatures(clientId),
                 UseMultipleWriteLocations = true,
                 IdleTcpConnectionTimeout = this.IdleTcpConnectionTimeout,
+                SessionRetryOptions = this.SessionRetryOptions,
                 OpenTcpConnectionTimeout = this.OpenTcpConnectionTimeout,
                 MaxRequestsPerTcpConnection = this.MaxRequestsPerTcpConnection,
                 MaxTcpConnectionsPerEndpoint = this.MaxTcpConnectionsPerEndpoint,
                 EnableEndpointDiscovery = !this.LimitToEndpoint,
-                EnablePartitionLevelFailover = this.EnablePartitionLevelFailover,
+                EnablePartitionLevelCircuitBreaker = this.EnablePartitionLevelCircuitBreaker,
+                DisablePartitionLevelFailoverClientLevelOverride = this.DisablePartitionLevelFailover,
                 PortReuseMode = this.portReuseMode,
                 EnableTcpConnectionEndpointRediscovery = this.EnableTcpConnectionEndpointRediscovery,
+                EnableAdvancedReplicaSelectionForTcp = this.EnableAdvancedReplicaSelectionForTcp,
                 HttpClientFactory = this.httpClientFactory,
-                ServerCertificateCustomValidationCallback = this.ServerCertificateCustomValidationCallback
+                ServerCertificateCustomValidationCallback = this.ServerCertificateCustomValidationCallback,
+                CosmosClientTelemetryOptions = new CosmosClientTelemetryOptions(),
+                AvailabilityStrategy = this.AvailabilityStrategy,
             };
 
-            if (this.EnableClientTelemetry.HasValue)
+            if (this.CosmosClientTelemetryOptions != null)
             {
-                connectionPolicy.EnableClientTelemetry = this.EnableClientTelemetry.Value;
+                connectionPolicy.CosmosClientTelemetryOptions = this.CosmosClientTelemetryOptions;
             }
 
-            if (this.ApplicationRegion != null)
+            RegionNameMapper mapper = new RegionNameMapper();
+            if (!string.IsNullOrEmpty(this.ApplicationRegion))
             {
-                connectionPolicy.SetCurrentLocation(this.ApplicationRegion);
+                connectionPolicy.SetCurrentLocation(mapper.GetCosmosDBRegionName(this.ApplicationRegion));
             }
 
             if (this.ApplicationPreferredRegions != null)
             {
-                connectionPolicy.SetPreferredLocations(this.ApplicationPreferredRegions);
+                List<string> mappedRegions = this.ApplicationPreferredRegions.Select(s => mapper.GetCosmosDBRegionName(s)).ToList();
+
+                connectionPolicy.SetPreferredLocations(mappedRegions);
+            }
+
+            if (this.AccountInitializationCustomEndpoints != null)
+            {
+                connectionPolicy.SetAccountInitializationCustomEndpoints(this.AccountInitializationCustomEndpoints);
             }
 
             if (this.MaxRetryAttemptsOnRateLimitedRequests != null)
@@ -826,15 +1219,36 @@ namespace Microsoft.Azure.Cosmos
 
         internal static string GetAccountEndpoint(string connectionString)
         {
-            return CosmosClientOptions.GetValueFromConnectionString(connectionString, CosmosClientOptions.ConnectionStringAccountEndpoint);
+            return CosmosClientOptions.GetValueFromConnectionString<string>(connectionString, CosmosClientOptions.ConnectionStringAccountEndpoint, null);
         }
 
         internal static string GetAccountKey(string connectionString)
         {
-            return CosmosClientOptions.GetValueFromConnectionString(connectionString, CosmosClientOptions.ConnectionStringAccountKey);
+            return CosmosClientOptions.GetValueFromConnectionString<string>(connectionString, CosmosClientOptions.ConnectionStringAccountKey, null);
         }
 
-        private static string GetValueFromConnectionString(string connectionString, string keyName)
+        internal static bool IsConnectionStringDisableServerCertificateValidationFlag(string connectionString)
+        {
+            return Convert.ToBoolean(CosmosClientOptions.GetValueFromConnectionString<bool>(connectionString, CosmosClientOptions.ConnectionStringDisableServerCertificateValidation, false));
+        }
+
+        internal static CosmosClientOptions GetCosmosClientOptionsWithCertificateFlag(string connectionString, CosmosClientOptions clientOptions)
+        {
+            clientOptions ??= new CosmosClientOptions();
+            if (CosmosClientOptions.IsConnectionStringDisableServerCertificateValidationFlag(connectionString))
+            {
+                clientOptions.DisableServerCertificateValidation = true;
+            }
+
+            return clientOptions;
+        }
+
+        internal bool IsCustomSerializerProvided()
+        {
+            return this.isCustomSerializerProvided;
+        }
+
+        private static T GetValueFromConnectionString<T>(string connectionString, string keyName, T defaultValue)
         {
             if (connectionString == null)
             {
@@ -847,8 +1261,20 @@ namespace Microsoft.Azure.Cosmos
                 string keyNameValue = value as string;
                 if (!string.IsNullOrEmpty(keyNameValue))
                 {
-                    return keyNameValue;
+                    try
+                    {
+                        return (T)Convert.ChangeType(value, typeof(T));
+                    }
+                    catch (InvalidCastException)
+                    {
+                        throw new ArgumentException("The connection string contains invalid property: " + keyName);
+                    }
                 }
+            }
+
+            if (defaultValue != null)
+            {
+                return defaultValue;
             }
 
             throw new ArgumentException("The connection string is missing a required property: " + keyName);
@@ -976,14 +1402,19 @@ namespace Microsoft.Azure.Cosmos
                     return;
                 }
 
-                CosmosJsonSerializerWrapper cosmosJsonSerializerWrapper = value as CosmosJsonSerializerWrapper;
-                if (value is CosmosJsonSerializerWrapper)
+                if (value is System.Text.Json.JsonSerializerOptions)
                 {
-                    writer.WriteValue(cosmosJsonSerializerWrapper.InternalJsonSerializer.GetType().ToString());
+                    writer.WriteValue(value.GetType().ToString());
+                    return;
                 }
 
-                CosmosSerializer cosmosSerializer = value as CosmosSerializer;
-                if (cosmosSerializer is CosmosSerializer)
+                if (value is CosmosJsonSerializerWrapper cosmosJsonSerializerWrapper)
+                {
+                    writer.WriteValue(cosmosJsonSerializerWrapper.InternalJsonSerializer.GetType().ToString());
+                    return;
+                }
+
+                if (value is CosmosSerializer cosmosSerializer)
                 {
                     writer.WriteValue(cosmosSerializer.GetType().ToString());
                 }
@@ -1001,29 +1432,5 @@ namespace Microsoft.Azure.Cosmos
                 return objectType == typeof(DateTime);
             }
         }
-        
-        /// <summary>
-        /// Distributed Tracing Options. <see cref="Microsoft.Azure.Cosmos.DistributedTracingOptions"/>
-        /// </summary>
-        /// <remarks> Applicable only when Operation level distributed tracing is enabled through <see cref="Microsoft.Azure.Cosmos.CosmosClientOptions.IsDistributedTracingEnabled"/></remarks>
-        internal DistributedTracingOptions DistributedTracingOptions { get; set; }
-
-        /// <summary>
-        /// Gets or sets the flag to generate operation level <see cref="System.Diagnostics.Activity"/> for methods calls using the Source Name "Azure.Cosmos.Operation".
-        /// </summary>
-        /// <value>
-        /// The default value is true (for preview package).
-        /// </value>
-        /// <remarks>This flag is there to disable it from source. Please Refer https://opentelemetry.io/docs/instrumentation/net/exporters/ to know more about open telemetry exporters</remarks>
-#if PREVIEW
-        public
-#else
-        internal
-#endif
-            bool IsDistributedTracingEnabled { get; set; }
-#if PREVIEW
-        = true;
-#endif
-
     }
 }

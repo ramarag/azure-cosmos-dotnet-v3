@@ -8,6 +8,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
     using System.Linq;
     using System.Net;
     using System.Net.Http;
+    using System.Threading;
     using System.Threading.Tasks;
     using Microsoft.Azure.Cosmos.Routing;
     using Microsoft.Azure.Cosmos.Tracing;
@@ -34,6 +35,9 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
         [TestMethod]
         public async Task VerifyPkRangeCacheRefreshOnSplitWithErrorsAsync()
         {
+            ManualResetEventSlim signalSplitException = new ManualResetEventSlim(false);
+            ManualResetEventSlim pkRangesRefreshed = new ManualResetEventSlim(false);
+
             int throwOnPkRefreshCount = 3;
             int pkRangeCalls = 0;
             bool causeSplitExceptionInRntbdCall = false;
@@ -50,11 +54,20 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 ifNoneMatchValues.Add(request.Headers.IfNoneMatch.ToString());
 
                 pkRangeCalls++;
-
-                if (pkRangeCalls == throwOnPkRefreshCount)
+                //account for metadata retry
+                if (pkRangeCalls == throwOnPkRefreshCount || pkRangeCalls == throwOnPkRefreshCount + 1)
                 {
                     failedIfNoneMatchValue = request.Headers.IfNoneMatch.ToString();
+                    if (signalSplitException.IsSet)
+                    {
+                        pkRangesRefreshed.Set();
+                    }
                     return Task.FromResult(new HttpResponseMessage(HttpStatusCode.InternalServerError));
+                }
+
+                if (signalSplitException.IsSet)
+                {
+                    pkRangesRefreshed.Set();
                 }
 
                 return null;
@@ -74,6 +87,8 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                         {
                             countSplitExceptions++;
                             causeSplitExceptionInRntbdCall = false;
+
+                            signalSplitException.Set();
                             throw new Documents.Routing.PartitionKeyRangeIsSplittingException("Test");
                         }
                     })
@@ -91,43 +106,36 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 400);
 
             // Start a background job that loops forever
+            ManualResetEventSlim backgroundOperationReady = new ManualResetEventSlim(false);
             List<Exception> exceptions = new();
-            Task backgroundItemOperatios = Task.Factory.StartNew(() => this.CreateAndReadItemBackgroundLoop(container, exceptions));
+            Task backgroundItemOperatios = Task.Factory.StartNew(() => this.CreateAndReadItemBackgroundLoop(container, exceptions, backgroundOperationReady));
 
             // Wait for the background job to start
-            Documents.ValueStopwatch stopwatch = Documents.ValueStopwatch.StartNew();
-            while (!this.loopBackgroundOperaitons && stopwatch.Elapsed.TotalSeconds < 30)
-            {
-                await Task.Delay(TimeSpan.FromSeconds(.5));
-            }
+            backgroundOperationReady.Wait();
 
             Assert.IsTrue(this.loopBackgroundOperaitons);
             Assert.AreEqual(2, pkRangeCalls);
 
             // Cause direct call to hit a split exception and wait for the background job to hit it
             causeSplitExceptionInRntbdCall = true;
-            stopwatch = Documents.ValueStopwatch.StartNew();
-            while (causeSplitExceptionInRntbdCall && stopwatch.Elapsed.TotalSeconds < 10)
-            {
-                await Task.Delay(TimeSpan.FromSeconds(.5));
-            }
+            signalSplitException.Wait();
+            pkRangesRefreshed.Wait();
             Assert.IsFalse(causeSplitExceptionInRntbdCall);
             Assert.AreEqual(3, pkRangeCalls);
 
+            signalSplitException.Reset();
+            pkRangesRefreshed.Reset();
+
             // Cause another direct call split exception
             causeSplitExceptionInRntbdCall = true;
-            stopwatch = Documents.ValueStopwatch.StartNew();
-            while (causeSplitExceptionInRntbdCall && stopwatch.Elapsed.TotalSeconds < 10)
-            {
-                await Task.Delay(TimeSpan.FromSeconds(.5));
-            }
-
+            signalSplitException.Wait();
+            pkRangesRefreshed.Wait();
             Assert.IsFalse(causeSplitExceptionInRntbdCall);
 
-            Assert.AreEqual(4, pkRangeCalls);
+            Assert.AreEqual(5, pkRangeCalls);
 
             Assert.AreEqual(1, ifNoneMatchValues.Count(x => string.IsNullOrEmpty(x)));
-            Assert.AreEqual(3, ifNoneMatchValues.Count(x => x == failedIfNoneMatchValue), $"3 request with same if none value. 1 initial, 2 from the split errors. split exception count: {countSplitExceptions}; {string.Join(';', ifNoneMatchValues)}");
+            Assert.AreEqual(4, ifNoneMatchValues.Count(x => x == failedIfNoneMatchValue), $"4 request with same if none value. 1 initial, 2 from the split errors, 1 retry. split exception count: {countSplitExceptions}; {string.Join(';', ifNoneMatchValues)}");
 
             HashSet<string> verifyUniqueIfNoneHeaderValues = new HashSet<string>();
             foreach (string ifNoneValue in ifNoneMatchValues)
@@ -147,7 +155,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
             await db.DeleteStreamAsync();
         }
 
-        private async Task CreateAndReadItemBackgroundLoop(Container container, List<Exception> exceptions)
+        private async Task CreateAndReadItemBackgroundLoop(Container container, List<Exception> exceptions, ManualResetEventSlim backgroundOperationReady)
         {
             this.loopBackgroundOperaitons = true;
 
@@ -167,6 +175,8 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 {
                     exceptions.Add(ex);
                 }
+
+                backgroundOperationReady.Set();
             }
         }
 

@@ -18,7 +18,7 @@
                 CreateInput(description: "case insensitive", scalarExpression: "aLl(SELECT *)"),
                 CreateInput(description: "nested", scalarExpression:"ALL( SELECT * WHERE ALL( SELECT *))"),
                 CreateInput(
-                    description: "multiple nested", 
+                    description: "multiple nested",
                     scalarExpression:
                 "ALL( "                         +
                 "   SELECT * "                  +
@@ -515,6 +515,30 @@
                 CreateInput(description: "Coalesce + Between", scalarExpression: "1 BETWEEN 3 ?? 4 AND 5 AND 6"),
                 CreateInput(description: "In + Between", scalarExpression: "SELECT 1 NOT BETWEEN 2 AND 1 NOT IN (1, 2, 3)"),
                 CreateInput(description: "Nested BETWEEN", scalarExpression: "1 BETWEEN 2 AND 3 BETWEEN 4 AND 5"),
+            };
+
+            this.ExecuteTestSuite(inputs);
+        }
+
+        [TestMethod]
+        public void StringLiteral()
+        {
+            List<SqlParserBaselineTestInput> inputs = new List<SqlParserBaselineTestInput>()
+            {
+                // Single quoted string literals do not allow ' even when it's escaped.
+                // Parser currently fails with Antlr4.Runtime.NoViableAltException
+                CreateInput(
+                    description: @"Single quoted string literals with escape seqence",
+                    scalarExpression: @"['\""DoubleQuote', '\\ReverseSolidus', '\/solidus', '\bBackspace', '\fSeparatorFeed', '\nLineFeed', '\rCarriageReturn', '\tTab', '\u1234']"),
+                CreateInput(
+                    description: @"Double quoted string literals with escape seqence",
+                    scalarExpression: @"[""'SingleQuote"", ""\""DoubleQuote"", ""\\ReverseSolidus"", ""\/solidus"", ""\bBackspace"", ""\fSeparatorFeed"", ""\nLineFeed"", ""\rCarriageReturn"", ""\tTab"", ""\u1234""]"),
+                CreateInput(
+                    description: @"Single quoted string literals special cases",
+                    scalarExpression: @"['\""', '\""\""', '\\', '\\\\', '\/', '\/\/', '\b', '\b\b', '\f', '\f\f', '\n', '\n\n', '\r', '\r\r', '\t', '\t\t', '\u1234', '\u1234\u1234']"),
+                CreateInput(
+                    description: @"Double quoted string literals special cases",
+                    scalarExpression: @"[""\"""", ""\""\"""", ""\\"", ""\\\\"", ""\/"", ""\/\/"", ""\b"", ""\b\b"", ""\f"", ""\f\f"", ""\n"", ""\n\n"", ""\r"", ""\r\r"", ""\t"", ""\t\t"", ""\u1234"", ""\u1234\u1234""]"),
             };
 
             this.ExecuteTestSuite(inputs);

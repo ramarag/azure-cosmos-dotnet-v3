@@ -12,6 +12,7 @@ namespace Microsoft.Azure.Cosmos
     using Microsoft.Azure.Cosmos.Diagnostics;
     using Microsoft.Azure.Cosmos.Linq;
     using Microsoft.Azure.Cosmos.Query.Core.Metrics;
+    using Microsoft.Azure.Cosmos.Query.Core.QueryAdvisor;
     using Microsoft.Azure.Cosmos.Resource.CosmosExceptions;
     using Microsoft.Azure.Cosmos.Tracing;
     using Microsoft.Azure.Documents;
@@ -83,7 +84,15 @@ namespace Microsoft.Azure.Cosmos
             this.CosmosException = cosmosException;
             this.Headers = headers ?? new Headers();
 
-            this.IndexUtilizationText = ResponseMessage.DecodeIndexMetrics(this.Headers, true);
+            this.IndexUtilizationText = ResponseMessage.DecodeIndexMetrics(this.Headers, isBase64Encoded: false);
+
+            this.QueryAdviceText = (this.Headers?.QueryAdvice != null)
+                ? new Lazy<string>(() =>
+                {
+                    Query.Core.QueryAdvisor.QueryAdvice.TryCreateFromString(this.Headers.QueryAdvice, out QueryAdvice queryAdvice);
+                    return queryAdvice?.ToString();
+                })
+                : null;
 
             if (requestMessage != null && requestMessage.Trace != null)
             {
@@ -142,6 +151,18 @@ namespace Microsoft.Azure.Cosmos
         /// The index utilization metrics.
         /// </value>
         public string IndexMetrics => this.IndexUtilizationText?.Value;
+
+        private Lazy<string> QueryAdviceText { get; }
+
+        /// <summary>
+        /// Gets the Query Advice in the current <see cref="ResponseMessage"/> to be used for debugging purposes. 
+        /// It's applicable to query response only. Other feed response will return null for this field.
+        /// This result is only available if QueryRequestOptions.PopulateQueryAdvice is set to true.
+        /// </summary>
+        /// <value>
+        /// The query advice.
+        /// </value>
+        internal string QueryAdvice => this.QueryAdviceText?.Value;
 
         /// <summary>
         /// Gets the original request message
@@ -251,21 +272,27 @@ namespace Microsoft.Azure.Cosmos
         /// Decode the Index Metrics from the response headers, if exists.
         /// </summary>
         /// <param name="responseMessageHeaders">The response headers</param>
-        /// <param name="isBse64Encoded">The encoding of the IndexMetrics response</param>
+        /// <param name="isBase64Encoded">The encoding of the IndexMetrics response</param>
         /// <returns>Lazy implementation of the pretty-printed IndexMetrics</returns>
-        static internal Lazy<string> DecodeIndexMetrics(Headers responseMessageHeaders, bool isBse64Encoded)
+        static internal Lazy<string> DecodeIndexMetrics(Headers responseMessageHeaders, bool isBase64Encoded)
         {
             if (responseMessageHeaders?.IndexUtilizationText != null)
             {
                 return new Lazy<string>(() =>
                     {
-                        IndexUtilizationInfo parsedIndexUtilizationInfo = IndexUtilizationInfo.CreateFromString(responseMessageHeaders.IndexUtilizationText, isBse64Encoded);
-                       
-                        StringBuilder stringBuilder = new StringBuilder();
-                        IndexMetricWriter indexMetricWriter = new IndexMetricWriter(stringBuilder);
-                        indexMetricWriter.WriteIndexMetrics(parsedIndexUtilizationInfo);
+                        if (isBase64Encoded)
+                        {
+                            IndexUtilizationInfo parsedIndexUtilizationInfo = IndexUtilizationInfo.CreateFromString(responseMessageHeaders.IndexUtilizationText);
 
-                        return stringBuilder.ToString();
+                            StringBuilder stringBuilder = new StringBuilder();
+                            IndexMetricsWriter indexMetricWriter = new IndexMetricsWriter(stringBuilder);
+                            indexMetricWriter.WriteIndexMetrics(parsedIndexUtilizationInfo);
+
+                            return stringBuilder.ToString();
+                        }
+                        
+                        // Return the JSON from the response header after url decode
+                        return System.Web.HttpUtility.UrlDecode(responseMessageHeaders.IndexUtilizationText, Encoding.UTF8); 
                     });
             }
 

@@ -15,27 +15,37 @@ namespace Microsoft.Azure.Cosmos
     using System.Threading;
     using System.Threading.Tasks;
     using Microsoft.Azure.Cosmos.Core.Trace;
+    using Microsoft.Azure.Cosmos.Linq;
     using Microsoft.Azure.Cosmos.Resource.CosmosExceptions;
+    using Microsoft.Azure.Cosmos.Tracing;
     using Microsoft.Azure.Cosmos.Tracing.TraceData;
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Collections;
+    using Microsoft.Azure.Documents.FaultInjection;
 
     internal sealed class CosmosHttpClientCore : CosmosHttpClient
     {
+        private const string FautInjecitonId = "FaultInjectionId";
+
         private readonly HttpClient httpClient;
         private readonly ICommunicationEventSource eventSource;
+        private readonly IChaosInterceptor chaosInterceptor;
 
         private bool disposedValue;
 
         private CosmosHttpClientCore(
             HttpClient httpClient,
             HttpMessageHandler httpMessageHandler,
-            ICommunicationEventSource eventSource)
+            ICommunicationEventSource eventSource,
+            IChaosInterceptor chaosInterceptor = null)
         {
             this.httpClient = httpClient ?? throw new ArgumentNullException(nameof(httpClient));
             this.eventSource = eventSource ?? throw new ArgumentNullException(nameof(eventSource));
             this.HttpMessageHandler = httpMessageHandler;
+            this.chaosInterceptor = chaosInterceptor;
         }
+
+        public override bool IsFaultInjectionClient => this.chaosInterceptor is not null;
 
         public override HttpMessageHandler HttpMessageHandler { get; }
 
@@ -45,7 +55,8 @@ namespace Microsoft.Azure.Cosmos
             ConnectionPolicy connectionPolicy,
             HttpMessageHandler httpMessageHandler,
             EventHandler<SendingRequestEventArgs> sendingRequestEventArgs,
-            EventHandler<ReceivedResponseEventArgs> receivedResponseEventArgs)
+            EventHandler<ReceivedResponseEventArgs> receivedResponseEventArgs,
+            IChaosInterceptor faultInjectionchaosInterceptor = null)
         {
             if (connectionPolicy == null)
             {
@@ -96,7 +107,8 @@ namespace Microsoft.Azure.Cosmos
                 requestTimeout: connectionPolicy.RequestTimeout,
                 userAgentContainer: connectionPolicy.UserAgentContainer,
                 apiType: apiType,
-                eventSource: eventSource);
+                eventSource: eventSource,
+                chaosInterceptor: faultInjectionchaosInterceptor);
         }
 
         public static HttpMessageHandler CreateHttpClientHandler(
@@ -115,7 +127,7 @@ namespace Microsoft.Azure.Cosmos
                 }
                 catch (Exception e)
                 {
-                    DefaultTrace.TraceError("Failed to create SocketsHttpHandler: {0}", e);
+                    DefaultTrace.TraceError("Failed to create SocketsHttpHandler: {0}", e.Message);
                 }
             }
             
@@ -123,8 +135,8 @@ namespace Microsoft.Azure.Cosmos
         }
 
         public static HttpMessageHandler CreateSocketsHttpHandlerHelper(
-            int gatewayModeMaxConnectionLimit, 
-            IWebProxy webProxy, 
+            int gatewayModeMaxConnectionLimit,
+            IWebProxy webProxy,
             Func<X509Certificate2, X509Chain, SslPolicyErrors, bool> serverCertificateCustomValidationCallback)
         {
             // TODO: Remove Reflection when multitargetting is possible
@@ -150,11 +162,61 @@ namespace Microsoft.Azure.Cosmos
             try
             {
                 PropertyInfo maxConnectionsPerServerInfo = socketHandlerType.GetProperty("MaxConnectionsPerServer");
-                maxConnectionsPerServerInfo.SetValue(socketHttpHandler, gatewayModeMaxConnectionLimit);              
+                maxConnectionsPerServerInfo.SetValue(socketHttpHandler, gatewayModeMaxConnectionLimit);
             }
             // MaxConnectionsPerServer is not supported on some platforms.
             catch (PlatformNotSupportedException)
             {
+            }
+
+            // Enable multiple HTTP/2 connections to the same server.
+            // This allows the HttpClient to open additional TCP connections when
+            // the maximum concurrent streams limit on an existing connection is reached,
+            // improving throughput for thin client mode which uses HTTP/2.
+            try
+            {
+                PropertyInfo enableMultipleHttp2ConnectionsInfo = socketHandlerType.GetProperty("EnableMultipleHttp2Connections");
+                enableMultipleHttp2ConnectionsInfo?.SetValue(socketHttpHandler, true);
+            }
+            catch (Exception ex)
+            {
+                DefaultTrace.TraceWarning("Failed to set EnableMultipleHttp2Connections on SocketsHttpHandler: {0}", ex.Message);
+            }
+
+            // Enable HTTP/2 PING keep-alive to detect broken connections.
+            // Without this, a broken HTTP/2 connection (e.g. after a network blip or load balancer
+            // reset) can remain in the pool indefinitely, causing persistent request failures
+            // that only resolve after application restart.
+            // KeepAlivePingDelay/Timeout/Policy are available on SocketsHttpHandler in .NET 5.0+.
+            try
+            {
+                int pingDelayInSeconds = ConfigurationManager.GetEnvironmentVariable<int>(
+                    ConfigurationManager.Http2KeepAlivePingDelayInSeconds,
+                    defaultValue: 1);
+
+                int pingTimeoutInSeconds = ConfigurationManager.GetEnvironmentVariable<int>(
+                    ConfigurationManager.Http2KeepAlivePingTimeoutInSeconds,
+                    defaultValue: 2);
+
+                PropertyInfo keepAlivePingDelayInfo = socketHandlerType.GetProperty("KeepAlivePingDelay");
+                keepAlivePingDelayInfo?.SetValue(socketHttpHandler, TimeSpan.FromSeconds(pingDelayInSeconds));
+
+                PropertyInfo keepAlivePingTimeoutInfo = socketHandlerType.GetProperty("KeepAlivePingTimeout");
+                keepAlivePingTimeoutInfo?.SetValue(socketHttpHandler, TimeSpan.FromSeconds(pingTimeoutInSeconds));
+
+                // HttpKeepAlivePingPolicy.Always = 1: send pings even for idle connections,
+                // which is critical for detecting broken connections lingering in the pool.
+                PropertyInfo keepAlivePingPolicyInfo = socketHandlerType.GetProperty("KeepAlivePingPolicy");
+                if (keepAlivePingPolicyInfo != null)
+                {
+                    Type pingPolicyType = keepAlivePingPolicyInfo.PropertyType;
+                    object alwaysValue = Enum.ToObject(pingPolicyType, 1);
+                    keepAlivePingPolicyInfo.SetValue(socketHttpHandler, alwaysValue);
+                }
+            }
+            catch (Exception ex)
+            {
+                DefaultTrace.TraceWarning("Failed to configure HTTP/2 keep-alive ping on SocketsHttpHandler: {0}", ex.Message);
             }
 
             if (serverCertificateCustomValidationCallback != null)
@@ -224,7 +286,8 @@ namespace Microsoft.Azure.Cosmos
             TimeSpan requestTimeout,
             UserAgentContainer userAgentContainer,
             ApiType apiType,
-            ICommunicationEventSource eventSource)
+            ICommunicationEventSource eventSource,
+            IChaosInterceptor chaosInterceptor = null)
         {
             if (httpClient == null)
             {
@@ -252,7 +315,8 @@ namespace Microsoft.Azure.Cosmos
             return new CosmosHttpClientCore(
                 httpClient,
                 httpMessageHandler,
-                eventSource);
+                eventSource,
+                chaosInterceptor);
         }
 
         public override Task<HttpResponseMessage> GetAsync(
@@ -261,7 +325,8 @@ namespace Microsoft.Azure.Cosmos
             ResourceType resourceType,
             HttpTimeoutPolicy timeoutPolicy,
             IClientSideRequestStatistics clientSideRequestStatistics,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            DocumentServiceRequest documentServiceRequest = null)
         {
             if (uri == null)
             {
@@ -292,7 +357,8 @@ namespace Microsoft.Azure.Cosmos
                 resourceType,
                 timeoutPolicy,
                 clientSideRequestStatistics,
-                cancellationToken);
+                cancellationToken,
+                documentServiceRequest);
         }
 
         public override Task<HttpResponseMessage> SendHttpAsync(
@@ -300,7 +366,8 @@ namespace Microsoft.Azure.Cosmos
             ResourceType resourceType,
             HttpTimeoutPolicy timeoutPolicy,
             IClientSideRequestStatistics clientSideRequestStatistics,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            DocumentServiceRequest documentServiceRequest = null)
         {
             if (createRequestMessageAsync == null)
             {
@@ -312,7 +379,8 @@ namespace Microsoft.Azure.Cosmos
                 resourceType,
                 timeoutPolicy,
                 clientSideRequestStatistics,
-                cancellationToken);
+                cancellationToken,
+                documentServiceRequest);
         }
 
         private async Task<HttpResponseMessage> SendHttpHelperAsync(
@@ -320,7 +388,8 @@ namespace Microsoft.Azure.Cosmos
             ResourceType resourceType,
             HttpTimeoutPolicy timeoutPolicy,
             IClientSideRequestStatistics clientSideRequestStatistics,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            DocumentServiceRequest documentServiceRequest)
         {
             DateTime startDateTimeUtc = DateTime.UtcNow;
             IEnumerator<(TimeSpan requestTimeout, TimeSpan delayForNextRequest)> timeoutEnumerator = timeoutPolicy.GetTimeoutEnumerator();
@@ -338,10 +407,26 @@ namespace Microsoft.Azure.Cosmos
                     DateTime requestStartTime = DateTime.UtcNow;
                     try
                     {
+                        if (this.chaosInterceptor != null && documentServiceRequest != null)
+                        {
+                            (bool hasFault, HttpResponseMessage fiResponseMessage) = await this.InjectFaultsAsync(cancellationTokenSource, documentServiceRequest, requestMessage);
+                            if (hasFault)
+                            {
+                                return fiResponseMessage;
+                            }
+                        }
+
                         HttpResponseMessage responseMessage = await this.ExecuteHttpHelperAsync(
                             requestMessage,
                             resourceType,
                             cancellationTokenSource.Token);
+
+                        if (this.chaosInterceptor != null && documentServiceRequest != null)
+                        {
+                            CancellationToken fiToken = cancellationTokenSource.Token;
+                            fiToken.ThrowIfCancellationRequested();
+                            await this.chaosInterceptor.OnAfterHttpSendAsync(documentServiceRequest, fiToken);
+                        }
 
                         if (clientSideRequestStatistics is ClientSideRequestStatisticsTraceDatum datum)
                         {
@@ -353,7 +438,7 @@ namespace Microsoft.Azure.Cosmos
                             return responseMessage;
                         }
 
-                        bool isOutOfRetries = CosmosHttpClientCore.IsOutOfRetries(timeoutPolicy, startDateTimeUtc, timeoutEnumerator);
+                        bool isOutOfRetries = CosmosHttpClientCore.IsOutOfRetries(timeoutEnumerator);
                         if (isOutOfRetries)
                         {
                             return responseMessage;
@@ -361,11 +446,13 @@ namespace Microsoft.Azure.Cosmos
                     }
                     catch (Exception e)
                     {
+                        ITrace trace = NoOpTrace.Singleton;
                         if (clientSideRequestStatistics is ClientSideRequestStatisticsTraceDatum datum)
                         {
                             datum.RecordHttpException(requestMessage, e, resourceType, requestStartTime);
+                            trace = datum.Trace;
                         }
-                        bool isOutOfRetries = CosmosHttpClientCore.IsOutOfRetries(timeoutPolicy, startDateTimeUtc, timeoutEnumerator);
+                        bool isOutOfRetries = CosmosHttpClientCore.IsOutOfRetries(timeoutEnumerator);
 
                         switch (e)
                         {
@@ -378,7 +465,7 @@ namespace Microsoft.Azure.Cosmos
 
                                 // Convert OperationCanceledException to 408 when the HTTP client throws it. This makes it clear that the 
                                 // the request timed out and was not user canceled operation.
-                                if (isOutOfRetries || !timeoutPolicy.IsSafeToRetry(requestMessage.Method))
+                                if (isOutOfRetries || !CosmosHttpClientCore.IsSafeToRetry(documentServiceRequest))
                                 {
                                     // throw current exception (caught in transport handler)
                                     string message =
@@ -394,6 +481,7 @@ namespace Microsoft.Azure.Cosmos
                                                 ActivityId = System.Diagnostics.Trace.CorrelationManager.ActivityId.ToString(),
                                                 SubStatusCode = SubStatusCodes.TransportGenerated503
                                             },
+                                            trace: trace,
                                             innerException: e);
                                     }
 
@@ -402,14 +490,14 @@ namespace Microsoft.Azure.Cosmos
 
                                 break;
                             case WebException webException:
-                                if (isOutOfRetries || (!timeoutPolicy.IsSafeToRetry(requestMessage.Method) && !WebExceptionUtility.IsWebExceptionRetriable(webException)))
+                                if (isOutOfRetries || (!CosmosHttpClientCore.IsSafeToRetry(documentServiceRequest) && !WebExceptionUtility.IsWebExceptionRetriable(webException)))
                                 {
                                     throw;
                                 }
 
                                 break;
                             case HttpRequestException httpRequestException:
-                                if (isOutOfRetries || !timeoutPolicy.IsSafeToRetry(requestMessage.Method))
+                                if (isOutOfRetries || !CosmosHttpClientCore.IsSafeToRetry(documentServiceRequest))
                                 {
                                     throw;
                                 }
@@ -429,13 +517,48 @@ namespace Microsoft.Azure.Cosmos
             }
         }
 
+        private async Task<(bool, HttpResponseMessage)> InjectFaultsAsync(
+            CancellationTokenSource cancellationTokenSource, 
+            DocumentServiceRequest documentServiceRequest, 
+            HttpRequestMessage requestMessage)
+        {
+            CancellationToken fiToken = cancellationTokenSource.Token;
+            fiToken.ThrowIfCancellationRequested();
+
+            //Set a request fault injeciton id for rule limit tracking
+            if (string.IsNullOrEmpty(documentServiceRequest.Headers.Get(CosmosHttpClientCore.FautInjecitonId)))
+            {
+                documentServiceRequest.Headers.Set(CosmosHttpClientCore.FautInjecitonId, Guid.NewGuid().ToString());
+            }
+            await this.chaosInterceptor.OnBeforeHttpSendAsync(documentServiceRequest, fiToken);
+
+            (bool hasFault,
+                HttpResponseMessage fiResponseMessage) = await this.chaosInterceptor.OnHttpRequestCallAsync(documentServiceRequest, fiToken);
+
+            if (hasFault)
+            {
+                fiResponseMessage.RequestMessage = requestMessage;
+            }
+            return (hasFault, fiResponseMessage);
+        }
+
         private static bool IsOutOfRetries(
-            HttpTimeoutPolicy timeoutPolicy,
-            DateTime startDateTimeUtc,
             IEnumerator<(TimeSpan requestTimeout, TimeSpan delayForNextRequest)> timeoutEnumerator)
         {
-            return (DateTime.UtcNow - startDateTimeUtc) > timeoutPolicy.MaximumRetryTimeLimit || // Maximum of time for all retries
-                !timeoutEnumerator.MoveNext(); // No more retries are configured
+            return !timeoutEnumerator.MoveNext(); // No more retries are configured
+        }
+
+        private static bool IsSafeToRetry(DocumentServiceRequest documentServiceRequest)
+        {
+            // Three scenarios are safely retriable:
+            // 1) If request is null since they are originated from GetAsync calls
+            // 2) If request is read-only
+            // 3) If request is an address request.
+            if (documentServiceRequest == null)
+            {
+                return true;
+            }
+            return documentServiceRequest.IsReadOnlyRequest || documentServiceRequest.ResourceType == ResourceType.Address;
         }
 
         private async Task<HttpResponseMessage> ExecuteHttpHelperAsync(

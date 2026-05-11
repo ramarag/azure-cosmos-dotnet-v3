@@ -31,6 +31,11 @@ namespace Microsoft.Azure.Cosmos.Routing
         private const string AddressResolutionBatchSize = "AddressResolutionBatchSize";
         private const int DefaultBatchSize = 50;
 
+        // This warmup cache and connection timeout is meant to mimic an indefinite timeframe till which
+        // a delay task will run, until a cancellation token is requested to cancel the task. The default
+        // value for this timeout is 45 minutes at the moment.
+        private static readonly TimeSpan WarmupCacheAndOpenConnectionTimeout = TimeSpan.FromMinutes(45);
+
         private readonly Uri serviceEndpoint;
         private readonly Uri addressEndpoint;
 
@@ -45,12 +50,15 @@ namespace Microsoft.Azure.Cosmos.Routing
         private readonly ICosmosAuthorizationTokenProvider tokenProvider;
         private readonly bool enableTcpConnectionEndpointRediscovery;
 
+        private readonly SemaphoreSlim semaphore;
         private readonly CosmosHttpClient httpClient;
         private readonly bool isReplicaAddressValidationEnabled;
+        private readonly IConnectionStateListener connectionStateListener;
 
         private Tuple<PartitionKeyRangeIdentity, PartitionAddressInformation> masterPartitionAddressCache;
         private DateTime suboptimalMasterPartitionTimestamp;
         private bool disposedValue;
+        private bool validateUnknownReplicas;
         private IOpenConnectionsHandler openConnectionsHandler;
 
         public GatewayAddressCache(
@@ -60,19 +68,23 @@ namespace Microsoft.Azure.Cosmos.Routing
             IServiceConfigurationReader serviceConfigReader,
             CosmosHttpClient httpClient,
             IOpenConnectionsHandler openConnectionsHandler,
+            IConnectionStateListener connectionStateListener,
             long suboptimalPartitionForceRefreshIntervalInSeconds = 600,
-            bool enableTcpConnectionEndpointRediscovery = false)
+            bool enableTcpConnectionEndpointRediscovery = false,
+            bool replicaAddressValidationEnabled = false,
+            bool enableAsyncCacheExceptionNoSharing = true)
         {
             this.addressEndpoint = new Uri(serviceEndpoint + "/" + Paths.AddressPathSegment);
             this.protocol = protocol;
             this.tokenProvider = tokenProvider;
             this.serviceEndpoint = serviceEndpoint;
             this.serviceConfigReader = serviceConfigReader;
-            this.serverPartitionAddressCache = new AsyncCacheNonBlocking<PartitionKeyRangeIdentity, PartitionAddressInformation>();
+            this.serverPartitionAddressCache = new AsyncCacheNonBlocking<PartitionKeyRangeIdentity, PartitionAddressInformation>(enableAsyncCacheExceptionNoSharing);
             this.suboptimalServerPartitionTimestamps = new ConcurrentDictionary<PartitionKeyRangeIdentity, DateTime>();
             this.serverPartitionAddressToPkRangeIdMap = new ConcurrentDictionary<ServerKey, HashSet<PartitionKeyRangeIdentity>>();
             this.suboptimalMasterPartitionTimestamp = DateTime.MaxValue;
             this.enableTcpConnectionEndpointRediscovery = enableTcpConnectionEndpointRediscovery;
+            this.connectionStateListener = connectionStateListener;
 
             this.suboptimalPartitionForceRefreshIntervalInSeconds = suboptimalPartitionForceRefreshIntervalInSeconds;
 
@@ -84,10 +96,10 @@ namespace Microsoft.Azure.Cosmos.Routing
                 Constants.Properties.Protocol,
                 GatewayAddressCache.ProtocolString(this.protocol));
 
+            this.semaphore = new SemaphoreSlim(1, 1);
             this.openConnectionsHandler = openConnectionsHandler;
-            this.isReplicaAddressValidationEnabled = Helpers.GetEnvironmentVariableAsBool(
-                name: Constants.EnvironmentVariables.ReplicaConnectivityValidationEnabled,
-                defaultValue: false);
+            this.isReplicaAddressValidationEnabled = replicaAddressValidationEnabled;
+            this.validateUnknownReplicas = false;
         }
 
         public Uri ServiceEndpoint => this.serviceEndpoint;
@@ -113,8 +125,16 @@ namespace Microsoft.Azure.Cosmos.Routing
             bool shouldOpenRntbdChannels,
             CancellationToken cancellationToken)
         {
-            List<Task<TryCatch<DocumentServiceResponse>>> tasks = new ();
+            List<Task> tasks = new ();
             int batchSize = GatewayAddressCache.DefaultBatchSize;
+
+            // By design, the Unknown replicas are validated only when the following two conditions meet:
+            // 1) The CosmosClient is initiated using the CreateAndInitializaAsync() flow.
+            // 2) The advanced replica selection feature enabled.
+            if (shouldOpenRntbdChannels)
+            {
+                this.validateUnknownReplicas = true;
+            }
 
 #if !(NETSTANDARD15 || NETSTANDARD16)
 #if NETSTANDARD20
@@ -147,50 +167,34 @@ namespace Microsoft.Azure.Cosmos.Routing
             {
                 for (int i = 0; i < partitionKeyRangeIdentities.Count; i += batchSize)
                 {
-                    tasks
-                        .Add(this.GetAddressesAsync(
-                            request: request,
-                            collectionRid: collection.ResourceId,
-                            partitionKeyRangeIds: partitionKeyRangeIdentities.Skip(i).Take(batchSize).Select(range => range.PartitionKeyRangeId)));
+                    tasks.Add(
+                        this.WarmupCachesAndOpenConnectionsAsync(
+                                request: request,
+                                collectionRid: collection.ResourceId,
+                                partitionKeyRangeIds: partitionKeyRangeIdentities.Skip(i).Take(batchSize).Select(range => range.PartitionKeyRangeId),
+                                containerProperties: collection,
+                                shouldOpenRntbdChannels: shouldOpenRntbdChannels,
+                                cancellationToken: cancellationToken));
                 }
             }
 
-            foreach (TryCatch<DocumentServiceResponse> task in await Task.WhenAll(tasks))
+            using CancellationTokenSource linkedTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+            // The `timeoutTask` is a background task which adds a delay for a period of WarmupCacheAndOpenConnectionTimeout. The task will
+            // be cancelled either by - a) when `linkedTokenSource` expires, which means the original `cancellationToken` expires or
+            // b) the the `linkedTokenSource.Cancel()` is called.
+            Task timeoutTask = Task.Delay(GatewayAddressCache.WarmupCacheAndOpenConnectionTimeout, linkedTokenSource.Token);
+            Task resultTask = await Task.WhenAny(Task.WhenAll(tasks), timeoutTask);
+
+            if (resultTask == timeoutTask)
             {
-                if (task.Failed)
-                {
-                    continue;
-                }
-
-                using (DocumentServiceResponse response = task.Result)
-                {
-                    FeedResource<Address> addressFeed = response.GetResource<FeedResource<Address>>();
-
-                    bool inNetworkRequest = this.IsInNetworkRequest(response);
-
-                    IEnumerable<Tuple<PartitionKeyRangeIdentity, PartitionAddressInformation>> addressInfos =
-                        addressFeed.Where(addressInfo => ProtocolFromString(addressInfo.Protocol) == this.protocol)
-                            .GroupBy(address => address.PartitionKeyRangeId, StringComparer.Ordinal)
-                            .Select(group => this.ToPartitionAddressAndRange(collection.ResourceId, @group.ToList(), inNetworkRequest));
-
-                    foreach (Tuple<PartitionKeyRangeIdentity, PartitionAddressInformation> addressInfo in addressInfos)
-                    {
-                        this.serverPartitionAddressCache.Set(
-                            new PartitionKeyRangeIdentity(collection.ResourceId, addressInfo.Item1.PartitionKeyRangeId),
-                            addressInfo.Item2);
-
-                        // The `shouldOpenRntbdChannels` boolean flag indicates whether the SDK should establish Rntbd connections to the
-                        // backend replica nodes. For the `CosmosClient.CreateAndInitializeAsync()` flow, the flag should be passed as
-                        // `true` so that the Rntbd connections to the backend replicas could be established deterministically. For any
-                        // other flow, the flag should be passed as `false`.
-                        if (this.openConnectionsHandler != null && shouldOpenRntbdChannels)
-                        {
-                            await this.openConnectionsHandler
-                                .TryOpenRntbdChannelsAsync(
-                                    addresses: addressInfo.Item2.Get(Protocol.Tcp)?.ReplicaTransportAddressUris);
-                        }
-                    }
-                }
+                // Operation has been cancelled.
+                DefaultTrace.TraceWarning("The open connection task was cancelled because the cancellation token was expired. '{0}'",
+                    System.Diagnostics.Trace.CorrelationManager.ActivityId);
+            }
+            else
+            {
+                linkedTokenSource.Cancel();
             }
         }
 
@@ -314,14 +318,35 @@ namespace Microsoft.Azure.Cosmos.Routing
                     .ReplicaTransportAddressUris
                     .Any(x => x.ShouldRefreshHealthStatus()))
                 {
-                    Task refreshAddressesInBackgroundTask = Task.Run(async () => await this.serverPartitionAddressCache.RefreshAsync(
-                        key: partitionKeyRangeIdentity,
-                        singleValueInitFunc: (currentCachedValue) => this.GetAddressesForRangeIdAsync(
-                                request,
-                                cachedAddresses: currentCachedValue,
+                    bool slimAcquired = await this.semaphore.WaitAsync(0);
+                    try
+                    {
+                        if (slimAcquired)
+                        {
+                            this.serverPartitionAddressCache.Refresh(
+                                key: partitionKeyRangeIdentity,
+                                singleValueInitFunc: (currentCachedValue) => this.GetAddressesForRangeIdAsync(
+                                    request,
+                                    cachedAddresses: currentCachedValue,
+                                    partitionKeyRangeIdentity.CollectionRid,
+                                    partitionKeyRangeIdentity.PartitionKeyRangeId,
+                                    forceRefresh: true));
+                        }
+                        else
+                        {
+                            DefaultTrace.TraceVerbose("Failed to refresh addresses in the background for the collection rid: {0}, partition key range id: {1}, because the semaphore is already acquired. '{2}'",
                                 partitionKeyRangeIdentity.CollectionRid,
                                 partitionKeyRangeIdentity.PartitionKeyRangeId,
-                                forceRefresh: true)));
+                                System.Diagnostics.Trace.CorrelationManager.ActivityId);
+                        }
+                    }
+                    finally
+                    {
+                        if (slimAcquired)
+                        {
+                            this.semaphore.Release();
+                        }
+                    }
                 }
 
                 return addresses;
@@ -350,6 +375,85 @@ namespace Microsoft.Azure.Cosmos.Routing
             }
         }
 
+        /// <summary>
+        /// Gets the address information from the gateway using the partition key range ids, and warms up the async non blocking cache
+        /// by inserting them as a key value pair for later lookup. Additionally attempts to establish Rntbd connections to the backend
+        /// replicas based on `shouldOpenRntbdChannels` boolean flag.
+        /// </summary>
+        /// <param name="request">An instance of <see cref="DocumentServiceRequest"/> containing the request payload.</param>
+        /// <param name="collectionRid">A string containing the collection ids.</param>
+        /// <param name="partitionKeyRangeIds">An instance of <see cref="IEnumerable{T}"/> containing the list of partition key range ids.</param>
+        /// <param name="containerProperties">An instance of <see cref="ContainerProperties"/> containing the collection properties.</param>
+        /// <param name="shouldOpenRntbdChannels">A boolean flag indicating whether Rntbd connections are required to be established to the backend replica nodes.</param>
+        /// <param name="cancellationToken">An instance of <see cref="CancellationToken"/>.</param>
+        private async Task WarmupCachesAndOpenConnectionsAsync(
+            DocumentServiceRequest request,
+            string collectionRid,
+            IEnumerable<string> partitionKeyRangeIds,
+            ContainerProperties containerProperties,
+            bool shouldOpenRntbdChannels,
+            CancellationToken cancellationToken)
+        {
+            TryCatch<DocumentServiceResponse> documentServiceResponseWrapper = await this.GetAddressesAsync(
+                                request: request,
+                                collectionRid: collectionRid,
+                                partitionKeyRangeIds: partitionKeyRangeIds);
+
+            if (documentServiceResponseWrapper.Failed)
+            {
+                return;
+            }
+
+            try
+            {
+                using (DocumentServiceResponse response = documentServiceResponseWrapper.Result)
+                {
+                    FeedResource<Address> addressFeed = response.GetResource<FeedResource<Address>>();
+
+                    bool inNetworkRequest = this.IsInNetworkRequest(response);
+
+                    IEnumerable<Tuple<PartitionKeyRangeIdentity, PartitionAddressInformation>> addressInfos =
+                        addressFeed.Where(addressInfo => ProtocolFromString(addressInfo.Protocol) == this.protocol)
+                            .GroupBy(address => address.PartitionKeyRangeId, StringComparer.Ordinal)
+                            .Select(group => this.ToPartitionAddressAndRange(containerProperties.ResourceId, @group.ToList(), inNetworkRequest));
+
+                    List<Task> openConnectionTasks = new ();
+                    foreach (Tuple<PartitionKeyRangeIdentity, PartitionAddressInformation> addressInfo in addressInfos)
+                    {
+                        if (cancellationToken.IsCancellationRequested)
+                        {
+                            break;
+                        }
+
+                        this.serverPartitionAddressCache.Set(
+                            new PartitionKeyRangeIdentity(containerProperties.ResourceId, addressInfo.Item1.PartitionKeyRangeId),
+                            addressInfo.Item2);
+
+                        // The `shouldOpenRntbdChannels` boolean flag indicates whether the SDK should establish Rntbd connections to the
+                        // backend replica nodes. For the `CosmosClient.CreateAndInitializeAsync()` flow, the flag should be passed as
+                        // `true` so that the Rntbd connections to the backend replicas could be established deterministically. For any
+                        // other flow, the flag should be passed as `false`.
+                        if (this.openConnectionsHandler != null && shouldOpenRntbdChannels)
+                        {
+                            openConnectionTasks
+                                .Add(this.openConnectionsHandler
+                                    .TryOpenRntbdChannelsAsync(
+                                        addresses: addressInfo.Item2.Get(Protocol.Tcp)?.ReplicaTransportAddressUris));
+                        }
+                    }
+
+                    await Task.WhenAll(openConnectionTasks);
+                }
+            }
+            catch (Exception ex)
+            {
+                DefaultTrace.TraceWarning("Failed to warm-up caches and open connections for the server addresses: {0} with exception: {1}. '{2}'",
+                    collectionRid,
+                    ex.Message,
+                    System.Diagnostics.Trace.CorrelationManager.ActivityId);
+            }
+        }
+
         private static void SetTransportAddressUrisToUnhealthy(
             PartitionAddressInformation stalePartitionAddressInformation,
             Lazy<HashSet<TransportAddressUri>> failedEndpoints)
@@ -370,6 +474,33 @@ namespace Microsoft.Azure.Cosmos.Routing
             foreach (TransportAddressUri failed in perProtocolPartitionAddressInformation)
             {
                 if (failedEndpoints.Value.Contains(failed))
+                {
+                    failed.SetUnhealthy();
+                }
+            }
+        }
+        // Overloaded method, the previous Lazy<HashSet<TransportAddressUri>> will be removed in a future release
+        // Once this is merged to master, we will cherry-pick the v3 master commit to OSS and create a new OSS release to use the OSS commit in the msdata PR to unblock the build failures from OSS.
+        private static void SetTransportAddressUrisToUnhealthy(
+           PartitionAddressInformation stalePartitionAddressInformation,
+           Lazy<ConcurrentDictionary<TransportAddressUri, bool>> failedEndpoints)
+        {
+            if (stalePartitionAddressInformation == null ||
+                failedEndpoints == null ||
+                !failedEndpoints.IsValueCreated)
+            {
+                return;
+            }
+
+            IReadOnlyList<TransportAddressUri> perProtocolPartitionAddressInformation = stalePartitionAddressInformation.Get(Protocol.Tcp)?.ReplicaTransportAddressUris;
+            if (perProtocolPartitionAddressInformation == null)
+            {
+                return;
+            }
+
+            foreach (TransportAddressUri failed in perProtocolPartitionAddressInformation)
+            {
+                if (failedEndpoints.Value.ContainsKey(failed))
                 {
                     failed.SetUnhealthy();
                 }
@@ -396,6 +527,13 @@ namespace Microsoft.Azure.Cosmos.Routing
         public async Task MarkAddressesToUnhealthyAsync(
             ServerKey serverKey)
         {
+            if (this.disposedValue)
+            {
+                // Will enable Listener to un-register in-case of un-graceful dispose
+                // <see cref="ConnectionStateMuxListener.NotifyAsync(ServerKey, ConcurrentDictionary{Func{ServerKey, Task}, object})"/>
+                throw new ObjectDisposedException(nameof(GatewayAddressCache));
+            }
+
             if (serverKey == null)
             {
                 throw new ArgumentNullException(nameof(serverKey));
@@ -438,6 +576,9 @@ namespace Microsoft.Azure.Cosmos.Routing
 
                         address.SetUnhealthy();
                     }
+
+                    // Update the health status
+                    this.CaptureTransportAddressUriHealthStates(addressInfo, transportAddresses);
                 }
             }
         }
@@ -550,9 +691,16 @@ namespace Microsoft.Azure.Cosmos.Routing
                     }
 
                     this.ValidateReplicaAddresses(transportAddressUris);
+                    this.CaptureTransportAddressUriHealthStates(
+                        partitionAddressInformation: mergedAddresses,
+                        transportAddressUris: transportAddressUris);
 
                     return mergedAddresses;
                 }
+
+                this.CaptureTransportAddressUriHealthStates(
+                    partitionAddressInformation: result.Item2,
+                    transportAddressUris: result.Item2.Get(Protocol.Tcp)?.ReplicaTransportAddressUris);
 
                 return result.Item2;
             }
@@ -607,11 +755,36 @@ namespace Microsoft.Azure.Cosmos.Routing
                 Uri targetEndpoint = UrlUtility.SetQuery(this.addressEndpoint, UrlUtility.CreateQuery(addressQuery));
 
                 string identifier = GatewayAddressCache.LogAddressResolutionStart(request, targetEndpoint);
+
+                if (this.httpClient.IsFaultInjectionClient)
+                {
+                    using (DocumentServiceRequest faultInjectionRequest = DocumentServiceRequest.Create(
+                        operationType: OperationType.Read,
+                        resourceType: ResourceType.Address,
+                        authorizationTokenType: AuthorizationTokenType.PrimaryMasterKey))
+                    {
+                        faultInjectionRequest.RequestContext = request.RequestContext;
+                        using (HttpResponseMessage httpResponseMessage = await this.httpClient.GetAsync(
+                            uri: targetEndpoint,
+                            additionalHeaders: headers,
+                            resourceType: resourceType,
+                            timeoutPolicy: HttpTimeoutPolicyControlPlaneRetriableHotPath.InstanceShouldThrow503OnTimeout,
+                            clientSideRequestStatistics: request.RequestContext?.ClientRequestStatistics,
+                            cancellationToken: default,
+                            documentServiceRequest: faultInjectionRequest))
+                        {
+                            DocumentServiceResponse documentServiceResponse = await ClientExtensions.ParseResponseAsync(httpResponseMessage);
+                            GatewayAddressCache.LogAddressResolutionEnd(request, identifier);
+                            return documentServiceResponse;
+                        }
+                    }
+                }
+
                 using (HttpResponseMessage httpResponseMessage = await this.httpClient.GetAsync(
                     uri: targetEndpoint,
                     additionalHeaders: headers,
                     resourceType: resourceType,
-                    timeoutPolicy: HttpTimeoutPolicyControlPlaneRetriableHotPath.Instance,
+                    timeoutPolicy: HttpTimeoutPolicyControlPlaneRetriableHotPath.InstanceShouldThrow503OnTimeout,
                     clientSideRequestStatistics: request.RequestContext?.ClientRequestStatistics,
                     cancellationToken: default))
                 {
@@ -688,11 +861,36 @@ namespace Microsoft.Azure.Cosmos.Routing
                 Uri targetEndpoint = UrlUtility.SetQuery(this.addressEndpoint, UrlUtility.CreateQuery(addressQuery));
 
                 string identifier = GatewayAddressCache.LogAddressResolutionStart(request, targetEndpoint);
+                
+                if (this.httpClient.IsFaultInjectionClient)
+                {
+                    using (DocumentServiceRequest faultInjectionRequest = DocumentServiceRequest.Create(
+                        operationType: OperationType.Read,
+                        resourceType: ResourceType.Address,
+                        authorizationTokenType: AuthorizationTokenType.PrimaryMasterKey))
+                    {
+                        faultInjectionRequest.RequestContext = request.RequestContext;
+                        using (HttpResponseMessage httpResponseMessage = await this.httpClient.GetAsync(
+                            uri: targetEndpoint,
+                            additionalHeaders: headers,
+                            resourceType: ResourceType.Document,
+                            timeoutPolicy: HttpTimeoutPolicyControlPlaneRetriableHotPath.InstanceShouldThrow503OnTimeout,
+                            clientSideRequestStatistics: request.RequestContext?.ClientRequestStatistics,
+                            cancellationToken: default,
+                            documentServiceRequest: faultInjectionRequest))
+                        {
+                            DocumentServiceResponse documentServiceResponse = await ClientExtensions.ParseResponseAsync(httpResponseMessage);
+                            GatewayAddressCache.LogAddressResolutionEnd(request, identifier);
+                            return documentServiceResponse;
+                        }
+                    }
+                }
+
                 using (HttpResponseMessage httpResponseMessage = await this.httpClient.GetAsync(
                     uri: targetEndpoint,
                     additionalHeaders: headers,
                     resourceType: ResourceType.Document,
-                    timeoutPolicy: HttpTimeoutPolicyControlPlaneRetriableHotPath.Instance,
+                    timeoutPolicy: HttpTimeoutPolicyControlPlaneRetriableHotPath.InstanceShouldThrow503OnTimeout,
                     clientSideRequestStatistics: request.RequestContext?.ClientRequestStatistics,
                     cancellationToken: default))
                 {
@@ -721,9 +919,21 @@ namespace Microsoft.Azure.Cosmos.Routing
                        partitionKeyRangeIdentity.PartitionKeyRangeId,
                        addressInfo.PhysicalUri);
 
+                    HashSet<PartitionKeyRangeIdentity> createdValue = null;
+                    ServerKey serverKey = new ServerKey(new Uri(addressInfo.PhysicalUri));
                     HashSet<PartitionKeyRangeIdentity> pkRangeIdSet = this.serverPartitionAddressToPkRangeIdMap.GetOrAdd(
-                        new ServerKey(new Uri(addressInfo.PhysicalUri)),
-                        (_) => new HashSet<PartitionKeyRangeIdentity>());
+                        serverKey,
+                        (_) =>
+                        {
+                            createdValue = new HashSet<PartitionKeyRangeIdentity>();
+                            return createdValue;
+                        });
+
+                    if (object.ReferenceEquals(pkRangeIdSet, createdValue))
+                    {
+                        this.connectionStateListener.Register(serverKey, this.MarkAddressesToUnhealthyAsync);
+                    }
+
                     lock (pkRangeIdSet)
                     {
                         pkRangeIdSet.Add(partitionKeyRangeIdentity);
@@ -786,7 +996,7 @@ namespace Microsoft.Azure.Cosmos.Routing
 
         private static Protocol ProtocolFromString(string protocol)
         {
-            return (protocol.ToLowerInvariant()) switch
+            return protocol.ToLowerInvariant() switch
             {
                 RuntimeConstants.Protocols.HTTPS => Protocol.Https,
                 RuntimeConstants.Protocols.RNTBD => Protocol.Tcp,
@@ -796,7 +1006,7 @@ namespace Microsoft.Azure.Cosmos.Routing
 
         private static string ProtocolString(Protocol protocol)
         {
-            return ((int)protocol) switch
+            return (int)protocol switch
             {
                 (int)Protocol.Https => RuntimeConstants.Protocols.HTTPS,
                 (int)Protocol.Tcp => RuntimeConstants.Protocols.RNTBD,
@@ -832,7 +1042,7 @@ namespace Microsoft.Azure.Cosmos.Routing
             {
                 DefaultTrace.TraceWarning("Failed to fetch the server addresses for: {0} with exception: {1}. '{2}'",
                     collectionRid,
-                    ex,
+                    ex.Message,
                     System.Diagnostics.Trace.CorrelationManager.ActivityId);
 
                 return TryCatch<DocumentServiceResponse>.FromException(ex);
@@ -921,30 +1131,61 @@ namespace Microsoft.Azure.Cosmos.Routing
         /// Returns a list of <see cref="TransportAddressUri"/> needed to validate their health status. Validating
         /// a uri is done by opening Rntbd connection to the backend replica, which is a costly operation by nature. Therefore
         /// vaidating both Unhealthy and Unknown replicas at the same time could impose a high CPU utilization. To avoid this
-        /// situation, the RntbdOpenConnectionHandler has good concurrency control mechanism to open the connections gracefully/>.
+        /// situation, the RntbdOpenConnectionHandler has good concurrency control mechanism to open the connections gracefully.
+        /// By default, this method only returns the Unhealthy replicas that requires to validate it's connectivity status. The
+        /// Unknown replicas are validated only when the CosmosClient is initiated using the CreateAndInitializaAsync() flow.
         /// </summary>
         /// <param name="transportAddresses">A read only list of <see cref="TransportAddressUri"/>s.</param>
         /// <returns>A list of <see cref="TransportAddressUri"/> that needs to validate their status.</returns>
         private IEnumerable<TransportAddressUri> GetAddressesNeededToValidateStatus(
             IReadOnlyList<TransportAddressUri> transportAddresses)
         {
-            return transportAddresses
-                .Where(address => address
+            return this.validateUnknownReplicas
+                ? transportAddresses
+                    .Where(address => address
                         .GetCurrentHealthState()
                         .GetHealthStatus() is
-                            TransportAddressHealthState.HealthStatus.Unknown or
+                            TransportAddressHealthState.HealthStatus.UnhealthyPending or
+                            TransportAddressHealthState.HealthStatus.Unknown)
+                : transportAddresses
+                    .Where(address => address
+                        .GetCurrentHealthState()
+                        .GetHealthStatus() is
                             TransportAddressHealthState.HealthStatus.UnhealthyPending);
+        }
+
+        /// <summary>
+        /// The replica health status of the transport address uri will change eventually with the motonically increasing time.
+        /// However, the purpose of this method is to capture the health status snapshot at this moment.
+        /// </summary>
+        /// <param name="partitionAddressInformation">An instance of <see cref="PartitionAddressInformation"/>.</param>
+        /// <param name="transportAddressUris">A read-only list of <see cref="TransportAddressUri"/>.</param>
+        private void CaptureTransportAddressUriHealthStates(
+            PartitionAddressInformation partitionAddressInformation,
+            IReadOnlyList<TransportAddressUri> transportAddressUris)
+        {
+            partitionAddressInformation
+                .Get(Protocol.Tcp)?
+                .SetTransportAddressUrisHealthState(
+                    replicaHealthStates: transportAddressUris.Select(x => x.GetCurrentHealthState().GetHealthStatusDiagnosticString()).ToList());
         }
 
         protected virtual void Dispose(bool disposing)
         {
             if (this.disposedValue)
             {
+                DefaultTrace.TraceInformation("GatewayAddressCache is already disposed {0}", this.GetHashCode());
                 return;
             }
 
             if (disposing)
             {
+                // Unregister the server-key
+                foreach (ServerKey serverKey in this.serverPartitionAddressToPkRangeIdMap.Keys)
+                {
+                    this.connectionStateListener.UnRegister(serverKey, this.MarkAddressesToUnhealthyAsync);
+                }
+
                 this.serverPartitionAddressCache?.Dispose();
             }
 

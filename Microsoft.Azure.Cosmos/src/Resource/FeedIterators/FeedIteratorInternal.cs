@@ -6,7 +6,6 @@ namespace Microsoft.Azure.Cosmos
 {
     using System.Threading;
     using System.Threading.Tasks;
-    using Microsoft.Azure.Cosmos.CosmosElements;
     using Microsoft.Azure.Cosmos.Tracing;
 
     /// <summary>
@@ -21,8 +20,6 @@ namespace Microsoft.Azure.Cosmos
 #endif
     abstract class FeedIteratorInternal : FeedIterator
     {
-        public abstract CosmosElement GetCosmosElementContinuationToken();
-
         public static bool IsRetriableException(CosmosException cosmosException)
         {
             return ((int)cosmosException.StatusCode == 429)

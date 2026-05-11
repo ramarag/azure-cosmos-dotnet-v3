@@ -9,7 +9,6 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryClient
     using System.Linq;
     using System.Threading;
     using System.Threading.Tasks;
-    using Microsoft.Azure.Cosmos.Diagnostics;
     using Microsoft.Azure.Cosmos.Query.Core.Monads;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline.Pagination;
     using Microsoft.Azure.Cosmos.Query.Core.QueryPlan;
@@ -24,6 +23,13 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryClient
             PartitionKey? partitionKey,
             ITrace trace,
             CancellationToken cancellationToken);
+
+        // ISSUE-TODO-adityasa-2025/12/29 - Reduce Coupling: we should not use PartitionKeyRange as return type for this internal interface.
+        // PartitionKeyRange contains a lot more information (for e.g. RidPrefix, Throughput related information, LSN, parent range id etc),
+        //  none of which is required by callers of these methods. The only information required is min & max values.
+        // Furthermore, the range is always min-inclusive and max-exclusive (since original PartitionKeyRange is such).
+        // Callers ultimately convert the returned PartitionKeyRange into a FeedRangeEpk.
+        // Applies to other methods below as well.
 
         /// <summary>
         /// Returns list of effective partition key ranges for a collection.
@@ -41,12 +47,14 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryClient
             SqlQuerySpec sqlQuerySpec,
             Documents.ResourceType resourceType,
             Documents.PartitionKeyDefinition partitionKeyDefinition,
+            Cosmos.VectorEmbeddingPolicy vectorEmbeddingPolicy,
             bool requireFormattableOrderByQuery,
             bool isContinuationExpected,
             bool allowNonValueAggregateQuery,
             bool hasLogicalPartitionKey,
             bool allowDCount,
             bool useSystemPrefix,
+            bool isHybridSearchQueryPlanOptimizationDisabled,
             Cosmos.GeospatialType geospatialType,
             CancellationToken cancellationToken);
 
@@ -54,15 +62,16 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryClient
             string resourceUri,
             Documents.ResourceType resourceType,
             Documents.OperationType operationType,
-            Guid clientQueryCorrelationId,
             FeedRange feedRange,
             QueryRequestOptions requestOptions,
+            AdditionalRequestHeaders additionalRequestHeaders,
             SqlQuerySpec sqlQuerySpec,
             string continuationToken,
-            bool isContinuationExpected,
             int pageSize,
             ITrace trace,
             CancellationToken cancellationToken);
+
+        public abstract Task<bool> GetClientDisableOptimisticDirectExecutionAsync();
 
         public abstract Task<PartitionedQueryExecutionInfo> ExecuteQueryPlanRequestAsync(
             string resourceUri,
@@ -77,15 +86,8 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryClient
 
         public abstract void ClearSessionTokenCache(string collectionFullName);
 
-        public abstract Task<List<Documents.PartitionKeyRange>> GetTargetPartitionKeyRangesByEpkStringAsync(
-            string resourceLink,
-            string collectionResourceId,
-            string effectivePartitionKeyString,
-            bool forceRefresh,
-            ITrace trace);
-
         public abstract Task<List<Documents.PartitionKeyRange>> GetTargetPartitionKeyRangeByFeedRangeAsync(
-            string resourceLink,
+            string resourceLink,    
             string collectionResourceId,
             Documents.PartitionKeyDefinition partitionKeyDefinition,
             FeedRangeInternal feedRangeInternal,
@@ -95,11 +97,11 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryClient
         public abstract Task<List<Documents.PartitionKeyRange>> GetTargetPartitionKeyRangesAsync(
             string resourceLink,
             string collectionResourceId,
-            List<Documents.Routing.Range<string>> providedRanges,
+            IReadOnlyList<Documents.Routing.Range<string>> providedRanges,
             bool forceRefresh,
             ITrace trace);
 
-        public abstract bool ByPassQueryParsing();
+        public abstract bool BypassQueryParsing();
 
         public abstract Task ForceRefreshCollectionCacheAsync(
             string collectionLink,

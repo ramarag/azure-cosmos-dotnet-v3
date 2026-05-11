@@ -9,6 +9,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Parser
     using System.Collections.Immutable;
     using System.Diagnostics.Contracts;
     using System.Globalization;
+    using System.Text;
     using Antlr4.Runtime.Misc;
     using Antlr4.Runtime.Tree;
     using Microsoft.Azure.Cosmos.SqlObjects;
@@ -355,14 +356,26 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Parser
         {
             Contract.Requires(context != null);
 
+            bool rank = context.K_RANK() != null;
             List<SqlOrderByItem> orderByItems = new List<SqlOrderByItem>();
-            foreach (sqlParser.Order_by_itemContext orderByItemContext in context.order_by_items().order_by_item())
+            if (rank)
             {
-                SqlOrderByItem orderByItem = (SqlOrderByItem)this.VisitOrder_by_item(orderByItemContext);
-                orderByItems.Add(orderByItem);
+                foreach (sqlParser.Score_expression_order_by_itemContext scoreOrderByItemContext in context.score_expression_order_by_items().score_expression_order_by_item())
+                {
+                    SqlOrderByItem orderByItem = (SqlOrderByItem)this.VisitScore_expression_order_by_item(scoreOrderByItemContext);
+                    orderByItems.Add(orderByItem);
+                }
+            }
+            else
+            {
+                foreach (sqlParser.Order_by_itemContext orderByItemContext in context.order_by_items().order_by_item())
+                {
+                    SqlOrderByItem orderByItem = (SqlOrderByItem)this.VisitOrder_by_item(orderByItemContext);
+                    orderByItems.Add(orderByItem);
+                }
             }
 
-            return SqlOrderByClause.Create(orderByItems.ToImmutableArray());
+            return SqlOrderByClause.Create(rank, orderByItems.ToImmutableArray());
         }
 
         public override SqlObject VisitOrder_by_item([NotNull] sqlParser.Order_by_itemContext context)
@@ -371,6 +384,31 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Parser
 
             SqlScalarExpression expression = (SqlScalarExpression)this.Visit(context.scalar_expression());
             bool isDescending = false;
+            if (context.sort_order() != null)
+            {
+                if (context.sort_order().K_ASC() != null)
+                {
+                    isDescending = false;
+                }
+                else if (context.sort_order().K_DESC() != null)
+                {
+                    isDescending = true;
+                }
+                else
+                {
+                    throw new ArgumentOutOfRangeException($"Unknown sort order : {context.sort_order()}.");
+                }
+            }
+
+            return SqlOrderByItem.Create(expression, isDescending);
+        }
+
+        public override SqlObject VisitScore_expression_order_by_item([NotNull] sqlParser.Score_expression_order_by_itemContext context)
+        {
+            Contract.Requires(context != null);
+
+            SqlFunctionCallScalarExpression expression = (SqlFunctionCallScalarExpression)this.Visit(context.function_call_scalar_expression());
+            bool? isDescending = null;
             if (context.sort_order() != null)
             {
                 if (context.sort_order().K_ASC() != null)
@@ -950,8 +988,45 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Parser
         private static string GetStringValueFromNode(IParseTree parseTree)
         {
             string text = parseTree.GetText();
-            string textWithoutQuotes = text.Substring(1, text.Length - 2).Replace("\\\"", "\"");
-            return textWithoutQuotes;
+
+            // 1. Remove leading and trailing (single or double) quotes.
+            // 2. Unescape following characters:
+            //    \" => "
+            //    \\ => \
+            //    \/ => /
+            // Based on the documentation, we should also escape single quote \'.
+            // https://learn.microsoft.com/en-us/azure/cosmos-db/nosql/query/constants#remarks
+            // However that's failing in the parser (before reaching this point) and will be fixed separately (after checking server's behavior).
+            StringBuilder stringBuilder = new StringBuilder(text.Length);
+            for (int index = 1; index < text.Length - 1; index++)
+            {
+                switch (text[index])
+                {
+                    case '\\':
+                        if ((index + 1) < (text.Length - 1))
+                        {
+                            switch (text[index + 1])
+                            {
+                                case '"':
+                                case '\\':
+                                case '/':
+                                    stringBuilder.Append(text[index + 1]);
+                                    index++;
+                                    break;
+                                default:
+                                    stringBuilder.Append(text[index]);
+                                    break;
+                            }
+                        }
+                        break;
+
+                    default:
+                        stringBuilder.Append(text[index]);
+                        break;
+                }
+            }
+
+            return stringBuilder.ToString();
         }
 
         private static Number64 GetNumber64ValueFromNode(IParseTree parseTree)

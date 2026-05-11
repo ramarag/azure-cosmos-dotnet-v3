@@ -65,6 +65,28 @@ namespace Microsoft.Azure.Cosmos
         }
 
         /// <summary>
+        /// Create a <see cref="RequestMessage"/>, used for Clone() method. 
+        /// </summary>
+        /// <param name="method">The http method</param>
+        /// <param name="requestUriString">The requested URI</param>
+        /// <param name="trace">The trace node to append traces to.</param>
+        /// <param name="headers">The headers to use.</param>
+        /// <param name="properties">The properties to use.</param>
+        private RequestMessage(
+            HttpMethod method,
+            string requestUriString,
+            ITrace trace,
+            Headers headers,
+            Dictionary<string, object> properties)
+        {
+            this.Method = method;
+            this.RequestUriString = requestUriString;
+            this.Trace = trace ?? throw new ArgumentNullException(nameof(trace));
+            this.headers = new Lazy<Headers>(() => headers);
+            this.properties = new Lazy<Dictionary<string, object>>(() => properties);
+        }
+
+        /// <summary>
         /// Gets the <see cref="HttpMethod"/> for the current request.
         /// </summary>
         public virtual HttpMethod Method { get; private set; }
@@ -214,7 +236,7 @@ namespace Microsoft.Azure.Cosmos
 
         internal async Task AssertPartitioningDetailsAsync(CosmosClient client, CancellationToken cancellationToken, ITrace trace)
         {
-            if (this.IsMasterOperation())
+            if (this.IsMasterOperation() || DistributedTransactionConstants.IsDistributedTransactionRequest(this.OperationType, this.ResourceType))
             {
                 return;
             }
@@ -244,7 +266,8 @@ namespace Microsoft.Azure.Cosmos
             if (this.DocumentServiceRequest == null)
             {
                 DocumentServiceRequest serviceRequest;
-                if (this.OperationType == OperationType.ReadFeed && this.ResourceType == ResourceType.Database)
+                if ((this.OperationType == OperationType.ReadFeed && this.ResourceType == ResourceType.Database)
+                    || DistributedTransactionConstants.IsDistributedTransactionRequest(this.OperationType, this.ResourceType))
                 {
                     serviceRequest = new DocumentServiceRequest(
                         operationType: this.OperationType,
@@ -273,6 +296,9 @@ namespace Microsoft.Azure.Cosmos
 
                 serviceRequest.UseStatusCodeForFailures = true;
                 serviceRequest.UseStatusCodeFor429 = true;
+                serviceRequest.UseStatusCodeFor403 = true;
+                serviceRequest.UseStatusCodeForBadRequest = true;
+                serviceRequest.UseStatusCodeFor4041002 = true;
                 serviceRequest.Properties = this.Properties;
                 this.DocumentServiceRequest = serviceRequest;
             }
@@ -282,9 +308,51 @@ namespace Microsoft.Azure.Cosmos
             {
                 this.DocumentServiceRequest.RouteTo(this.PartitionKeyRangeId);
             }
-
+            
+            this.DocumentServiceRequest.RequestContext.ExcludeRegions = this.RequestOptions?.ExcludeRegions;
             this.OnBeforeRequestHandler(this.DocumentServiceRequest);
             return this.DocumentServiceRequest;
+        }
+
+        /// <summary>
+        /// Clone the request message
+        /// </summary>
+        /// <returns>a cloned copy of the RequestMessage</returns>
+        internal RequestMessage Clone(ITrace newTrace, CloneableStream cloneContent)
+        {
+            RequestMessage clone = new RequestMessage(
+                this.Method,
+                this.RequestUriString,
+                newTrace,
+                this.Headers.Clone(),
+                new Dictionary<string, object>(this.Properties));
+
+            if (this.Content != null && cloneContent != null)
+            {
+                clone.Content = cloneContent.Clone();
+            }
+
+            if (this.RequestOptions != null)
+            {
+                clone.RequestOptions = this.RequestOptions.ShallowCopy();
+            }
+
+            clone.ResourceType = this.ResourceType;
+
+            clone.OperationType = this.OperationType;
+
+            if (this.PartitionKeyRangeId != null)
+            {
+                clone.PartitionKeyRangeId = string.IsNullOrEmpty(this.PartitionKeyRangeId.CollectionRid)
+                    ? new PartitionKeyRangeIdentity(this.PartitionKeyRangeId.PartitionKeyRangeId)
+                    : new PartitionKeyRangeIdentity(this.PartitionKeyRangeId.CollectionRid, this.PartitionKeyRangeId.PartitionKeyRangeId);
+            }
+
+            clone.UseGatewayMode = this.UseGatewayMode;
+            clone.ContainerId = this.ContainerId;
+            clone.DatabaseId = this.DatabaseId;
+
+            return clone;
         }
 
         private static Dictionary<string, object> CreateDictionary()
@@ -299,6 +367,7 @@ namespace Microsoft.Azure.Cosmos
 
         private void OnBeforeRequestHandler(DocumentServiceRequest serviceRequest)
         {
+            serviceRequest.RequestContext.ExcludeRegions = this.RequestOptions?.ExcludeRegions;
             this.OnBeforeSendRequestActions?.Invoke(serviceRequest);
         }
 
@@ -321,8 +390,12 @@ namespace Microsoft.Azure.Cosmos
             bool partitionKeyRangeIdExists = !string.IsNullOrEmpty(this.Headers.PartitionKeyRangeId);
             if (partitionKeyRangeIdExists)
             {
+                OperationType operationType = this.OperationType;
                 // Assert operation type is not write
-                if (this.OperationType != OperationType.Query && this.OperationType != OperationType.ReadFeed && this.OperationType != OperationType.Batch)
+                if (operationType != OperationType.Query
+                    && operationType != OperationType.QueryPlan
+                    && operationType != OperationType.ReadFeed 
+                    && operationType != OperationType.Batch)
                 {
                     throw new ArgumentOutOfRangeException(RMResources.UnexpectedPartitionKeyRangeId);
                 }

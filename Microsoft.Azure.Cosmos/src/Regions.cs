@@ -36,6 +36,11 @@ namespace Microsoft.Azure.Cosmos
         public const string EastUS2 = "East US 2";
 
         /// <summary>
+        /// Name of the Azure East US 3 region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string EastUS3 = "East US 3";
+
+        /// <summary>
         /// Name of the Azure Central US region in the Azure Cosmos DB service.
         /// </summary>
         public const string CentralUS = "Central US";
@@ -69,6 +74,11 @@ namespace Microsoft.Azure.Cosmos
         /// Name of the Azure Southeast Asia region in the Azure Cosmos DB service.
         /// </summary>
         public const string SoutheastAsia = "Southeast Asia";
+
+        /// <summary>
+        /// Name of the Azure Southeast Asia 3 region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string SoutheastAsia3 = "Southeast Asia 3";
 
         /// <summary>
         /// Name of the Azure Japan East region in the Azure Cosmos DB service.
@@ -114,16 +124,6 @@ namespace Microsoft.Azure.Cosmos
         /// Name of the Azure Canada Central region in the Azure Cosmos DB service.
         /// </summary>
         public const string CanadaCentral = "Canada Central";
-
-        /// <summary>
-        /// Name of the Azure Germany Central region in the Azure Cosmos DB service.
-        /// </summary>
-        public const string GermanyCentral = "Germany Central";
-
-        /// <summary>
-        /// Name of the Azure Germany Northeast region in the Azure Cosmos DB service.
-        /// </summary>
-        public const string GermanyNortheast = "Germany Northeast";
 
         /// <summary>
         /// Name of the Azure China North region in the Azure Cosmos DB service.
@@ -266,6 +266,11 @@ namespace Microsoft.Azure.Cosmos
         public const string USSecWest = "USSec West";
 
         /// <summary>
+        /// Name of the Azure USNat West Central region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string USSecWestCentral = "USSec West Central";
+
+        /// <summary>
         /// Name of the Azure Switzerland North region in the Azure Cosmos DB service.
         /// </summary>
         public const string SwitzerlandNorth = "Switzerland North";
@@ -349,5 +354,155 @@ namespace Microsoft.Azure.Cosmos
         /// Name of the Azure Poland Central region in the Azure Cosmos DB service.
         /// </summary>
         public const string PolandCentral = "Poland Central";
+
+        /// <summary>
+        /// Name of the Azure Malaysia South region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string MalaysiaSouth = "Malaysia South";
+
+        /// <summary>
+        /// Name of the Azure Italy North region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string ItalyNorth = "Italy North";
+
+        /// <summary>
+        /// Name of the Azure Israel Central region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string IsraelCentral = "Israel Central";
+
+        /// <summary>
+        /// Name of the Azure Mexico Central region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string MexicoCentral = "Mexico Central";
+
+        /// <summary>
+        /// Name of the Azure Spain Central region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string SpainCentral = "Spain Central";
+
+        /// <summary>
+        /// Name of the Azure Taiwan North region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string TaiwanNorth = "Taiwan North";
+
+        /// <summary>
+        /// Name of the Azure Taiwan Northwest region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string TaiwanNorthwest = "Taiwan Northwest";
+
+        /// <summary>
+        /// Name of the Azure New Zealand North region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string NewZealandNorth = "New Zealand North";
+
+        /// <summary>
+        /// Name of the Azure Austria East region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string AustriaEast = "Austria East";
+
+        /// <summary>
+        /// Name of the Azure Bleu France Central region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string BleuFranceCentral = "Bleu France Central";
+
+        /// <summary>
+        /// Name of the Azure Bleu France South region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string BleuFranceSouth = "Bleu France South";
+
+        /// <summary>
+        /// Name of the Azure Indonesia Central region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string IndonesiaCentral = "Indonesia Central";
+
+        /// <summary>
+        /// Name of the Azure Southeast US region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string SoutheastUS = "Southeast US";
+
+        /// <summary>
+        /// Name of the Azure Southwest US region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string SouthwestUS = "Southwest US";
+
+        /// <summary>
+        /// Name of the Azure Malaysia West region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string MalaysiaWest = "Malaysia West";
+
+        /// <summary>
+        /// Name of the Azure Delos Cloud Germany Central region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string DelosCloudGermanyCentral = "Delos Cloud Germany Central";
+
+        /// <summary>
+        /// Name of the Azure Delos Cloud Germany North region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string DelosCloudGermanyNorth = "Delos Cloud Germany North";
+
+        /// <summary>
+        /// Name of the Azure Chile Central region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string ChileCentral = "Chile Central";
+
+        /// <summary>
+        /// Name of the Azure South Central US 2 region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string SouthCentralUS2 = "South Central US 2";
+
+        /// <summary>
+        /// Name of the Azure Israel Northwest region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string IsraelNorthwest = "Israel Northwest";
+
+        /// <summary>
+        /// Name of the Azure Belgium Central region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string BelgiumCentral = "Belgium Central";
+
+        /// <summary>
+        /// Name of the Azure Denmark East region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string DenmarkEast = "Denmark East";
+
+        /// <summary>
+        /// Name of the Azure Southeast US 3 region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string SoutheastUS3 = "Southeast US 3";
+
+        /// <summary>
+        /// Name of the Azure Southeast US 5 region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string SoutheastUS5 = "Southeast US 5";
+
+        /// <summary>
+        /// Name of the Azure Northeast US 5 region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string NortheastUS5 = "Northeast US 5";
+
+        /// <summary>
+        /// Name of the Azure India South Central region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string IndiaSouthCentral = "India South Central";
+
+        /// <summary>
+        /// Name of the Azure Singapore Central region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string SingaporeCentral = "Singapore Central";
+
+        /// <summary>
+        /// Name of the Azure Singapore North region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string SingaporeNorth = "Singapore North";
+
+        /// <summary>
+        /// Name of the Azure Saudi Arabia East region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string SaudiArabiaEast = "Saudi Arabia East";
+
+        /// <summary>
+        /// Name of the Azure West Central US FRE region in the Azure Cosmos DB service.
+        /// </summary>
+        public const string WestCentralUSFRE = "West Central US FRE";
     }
 }

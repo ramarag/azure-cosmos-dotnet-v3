@@ -10,6 +10,7 @@
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
     <RootNamespace>Microsoft.Azure.Cosmos.Tests</RootNamespace>
     <LangVersion>$(LangVersion)</LangVersion>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
   </PropertyGroup>
 
   <ItemGroup>
@@ -31,6 +32,7 @@
     <None Remove="BaselineTest\TestBaseline\SqlObjectVisitorBaselineTests.SqlQueries.xml" />
     <None Remove="BaselineTest\TestBaseline\SqlObjectVisitorBaselineTests.SqlScalarExpression.xml" />
     <None Remove="BaselineTest\TestBaseline\SqlObjectVisitorBaselineTests.SqlUnaryScalarOperators.xml" />
+    <None Remove="BaselineTest\TestBaseline\SubpartitionTests.TestQueriesOnSplitContainer.xml" />
     <None Remove="BaselineTest\TestBaseline\TraceWriterBaselineTests.ScenariosAsync.xml" />
     <None Remove="BaselineTest\TestBaseline\TraceWriterBaselineTests.Serialization.xml" />
     <None Remove="BaselineTest\TestBaseline\TraceWriterBaselineTests.TraceData.xml" />
@@ -44,18 +46,19 @@
 
   <ItemGroup>
     <Compile Include="..\Microsoft.Azure.Cosmos.EmulatorTests\Utils\LocalEmulatorTokenCredential.cs" Link="Utils\LocalEmulatorTokenCredential.cs" />
+    <Compile Include="..\Microsoft.Azure.Cosmos.EmulatorTests\Linq\SystemTextJsonSerializer.cs" Link="Linq\SystemTextJsonSerializer.cs" />
   </ItemGroup>
 
   <ItemGroup>
-    <PackageReference Include="Azure.Core" Version="1.19.0" />
+    <PackageReference Include="Azure.Core" Version="1.44.1" />
     <PackageReference Include="FluentAssertions" Version="5.10.3" />
     <PackageReference Include="Microsoft.Extensions.DependencyInjection" Version="2.1.1" />
     <PackageReference Include="Microsoft.IdentityModel.Tokens" Version="6.7.1" />
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="16.2.0" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.12.0" />
     <PackageReference Include="Moq" Version="4.8.3" />
-    <PackageReference Include="MSTest.TestAdapter" Version="1.2.0" />
-    <PackageReference Include="MSTest.TestFramework" Version="1.2.0" />
-    <PackageReference Include="Newtonsoft.Json" Version="13.0.1" />
+    <PackageReference Include="MSTest.TestAdapter" Version="3.7.3" />
+    <PackageReference Include="MSTest.TestFramework" Version="3.7.3" />
+    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
     <PackageReference Include="coverlet.msbuild" Version="2.8.1">
       <PrivateAssets>all</PrivateAssets>
       <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
@@ -79,7 +82,13 @@
   </ItemGroup>
 
   <ItemGroup>
+    <None Update="BaselineTest\TestBaseline\ClientDistributionPlanBaselineTests.TestClientDistributionPlanDeserialization.xml">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
     <None Update="BaselineTest\TestBaseline\GroupByClauseSqlParserBaselineTests.Tests.xml">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="BaselineTest\TestBaseline\ScalarExpressionSqlParserBaselineTests.StringLiteral.xml">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <None Update="BaselineTest\TestBaseline\SelectClauseSqlParserBaselineTests.Tests.xml">
@@ -109,12 +118,21 @@
     <None Update="BaselineTest\TestBaseline\OrderByClauseSqlParserBaselineTests.MultiOrderBy.xml">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <None Update="BaselineTest\TestBaseline\OrderByClauseSqlParserBaselineTests.MultiOrderByRank.xml">
+        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+      <None Update="BaselineTest\TestBaseline\OrderByClauseSqlParserBaselineTests.SingleOrderByRank.xml">
+          <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      </None>
     <None Update="BaselineTest\TestBaseline\PartitionKeyHashBaselineTest.Numbers.xml">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <None Update="BaselineTest\TestBaseline\PartitionKeyHashBaselineTest.Strings.xml">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+	<None Update="BaselineTest\TestBaseline\PartitionKeyHashBaselineTest.Lists.xml">
+       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+	</None>
     <None Update="BaselineTest\TestBaseline\DistinctHashBaselineTests.WrappedElementsHash.xml">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
@@ -250,16 +268,22 @@
     <None Update="BaselineTest\TestBaseline\QueryPlanBaselineTests.Top.xml">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
+    <None Update="BaselineTest\TestBaseline\QueryPlanBaselineTests.VectorSearch.xml">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
     <None Update="BaselineTest\TestBaseline\OptimisticDirectExecutionQueryBaselineTests.PositiveOptimisticDirectExecutionOutput.xml">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
     <None Update="BaselineTest\TestBaseline\OptimisticDirectExecutionQueryBaselineTests.NegativeOptimisticDirectExecutionOutput.xml">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </None>
-    <None Update="Contracts\DotNetPreviewSDKAPI.json">
+    <None Update="Contracts\DotNetPreviewSDKAPI*.json">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </None>
-    <None Update="Contracts\DotNetSDKAPI.json">
+    <None Update="Contracts\DotNetSDKAPI*.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
+    <None Update="Contracts\DotNetSDKTelemetryAPI*.json">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </None>
     <None Update="Routing\resources\BaselineTest.PartitionRoutingHelper.AddFormattedContinuationToHeader.json">
@@ -337,6 +361,9 @@
   </ItemGroup>
 
   <ItemGroup>
+    <Content Include="BaselineTest\TestBaseline\SubpartitionTests.TestQueriesOnSplitContainer.xml">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
     <Content Include="BaselineTest\TestBaseline\TraceWriterBaselineTests.TraceData.xml">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
@@ -386,6 +413,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <None Include="..\..\..\Directory.Build.props" Link="Directory.Build.props">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
     <Compile Update="Tracing\TraceWriterBaselineTests.cs">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Compile>
@@ -398,4 +431,3 @@
   </PropertyGroup>
   
 </Project>
-

@@ -10,7 +10,6 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
     using System.Threading.Tasks;
     using Microsoft.Azure.Cosmos.Query.Core.Monads;
     using Microsoft.Azure.Cosmos.Query.Core.QueryClient;
-    using Microsoft.Azure.Cosmos.Resource.CosmosExceptions;
     using Microsoft.Azure.Cosmos.Tracing;
     using OperationType = Documents.OperationType;
     using PartitionKeyDefinition = Documents.PartitionKeyDefinition;
@@ -28,18 +27,43 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
             | QueryFeatures.OrderBy
             | QueryFeatures.Top
             | QueryFeatures.NonValueAggregate
-            | QueryFeatures.DCount;
+            | QueryFeatures.DCount
+            | QueryFeatures.NonStreamingOrderBy
+            | QueryFeatures.CountIf
+            | QueryFeatures.HybridSearch
+            | QueryFeatures.WeightedRankFusion
+            | QueryFeatures.HybridSearchSkipOrderByRewrite;
+
+        private static readonly QueryFeatures SupportedQueryFeaturesWithHybridSearchQueryPlanOptimizationDisabled =
+            SupportedQueryFeatures & (~QueryFeatures.HybridSearchSkipOrderByRewrite);
 
         private static readonly string SupportedQueryFeaturesString = SupportedQueryFeatures.ToString();
+
+        private static readonly string SupportedQueryFeaturesWithHybridSearchQueryPlanOptimizationDisabledString =
+            SupportedQueryFeaturesWithHybridSearchQueryPlanOptimizationDisabled.ToString();
+
+        private static string GetSupportedQueryFeaturesString(bool isHybridSearchQueryPlanOptimizationDisabled)
+        {
+            return isHybridSearchQueryPlanOptimizationDisabled ?
+                SupportedQueryFeaturesWithHybridSearchQueryPlanOptimizationDisabledString :
+                SupportedQueryFeaturesString;
+        }
+
+        public static bool BypassQueryParsing()
+        {
+            return Documents.CustomTypeExtensions.ByPassQueryParsing() || ConfigurationManager.ForceBypassQueryParsing();
+        }
 
         public static async Task<PartitionedQueryExecutionInfo> GetQueryPlanWithServiceInteropAsync(
             CosmosQueryClient queryClient,
             SqlQuerySpec sqlQuerySpec,
             Documents.ResourceType resourceType,
             PartitionKeyDefinition partitionKeyDefinition,
+            VectorEmbeddingPolicy vectorEmbeddingPolicy,
             bool hasLogicalPartitionKey,
             GeospatialType geospatialType,
             bool useSystemPrefix,
+            bool isHybridSearchQueryPlanOptimizationDisabled,
             ITrace trace,
             CancellationToken cancellationToken = default)
         {
@@ -68,9 +92,10 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
                     sqlQuerySpec,
                     resourceType,
                     partitionKeyDefinition,
-                    QueryPlanRetriever.SupportedQueryFeatures,
+                    vectorEmbeddingPolicy,
                     hasLogicalPartitionKey,
                     useSystemPrefix,
+                    isHybridSearchQueryPlanOptimizationDisabled,
                     geospatialType,
                     cancellationToken);
 
@@ -95,6 +120,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
             SqlQuerySpec sqlQuerySpec,
             string resourceLink,
             PartitionKey? partitionKey,
+            bool isHybridSearchQueryPlanOptimizationDisabled,
             ITrace trace,
             CancellationToken cancellationToken = default)
         {
@@ -130,7 +156,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
                     OperationType.QueryPlan,
                     sqlQuerySpec,
                     partitionKey,
-                    QueryPlanRetriever.SupportedQueryFeaturesString,
+                    GetSupportedQueryFeaturesString(isHybridSearchQueryPlanOptimizationDisabled),
                     trace,
                     cancellationToken);
             }

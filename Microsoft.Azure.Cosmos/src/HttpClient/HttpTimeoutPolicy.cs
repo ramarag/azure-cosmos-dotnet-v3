@@ -11,17 +11,17 @@ namespace Microsoft.Azure.Cosmos
     internal abstract class HttpTimeoutPolicy
     {
         public abstract string TimeoutPolicyName { get; }
-        public abstract TimeSpan MaximumRetryTimeLimit { get; }
         public abstract int TotalRetryCount { get; }
         public abstract IEnumerator<(TimeSpan requestTimeout, TimeSpan delayForNextRequest)> GetTimeoutEnumerator();
-        public abstract bool IsSafeToRetry(HttpMethod httpMethod);
 
         public abstract bool ShouldRetryBasedOnResponse(HttpMethod requestHttpMethod, HttpResponseMessage responseMessage);
 
         public virtual bool ShouldThrow503OnTimeout => false;
 
         public static HttpTimeoutPolicy GetTimeoutPolicy(
-           DocumentServiceRequest documentServiceRequest)
+           DocumentServiceRequest documentServiceRequest,
+           bool isPartitionLevelFailoverEnabled = false,
+           bool isThinClientEnabled = false)
         {
             //Query Plan Requests
             if (documentServiceRequest.ResourceType == ResourceType.Document
@@ -30,22 +30,55 @@ namespace Microsoft.Azure.Cosmos
                 return HttpTimeoutPolicyControlPlaneRetriableHotPath.InstanceShouldThrow503OnTimeout;
             }
 
-            //Partition Key Requests
-            if (documentServiceRequest.ResourceType == ResourceType.PartitionKeyRange)
+            //Get Partition Key Range Requests
+            if (documentServiceRequest.ResourceType == ResourceType.PartitionKeyRange
+                && documentServiceRequest.OperationType == OperationType.ReadFeed)
             {
-                return HttpTimeoutPolicyControlPlaneRetriableHotPath.Instance;
+                return HttpTimeoutPolicyControlPlaneRetriableHotPath.InstanceShouldThrow503OnTimeout;
             }
 
-            //Data Plane Read
-            if (!HttpTimeoutPolicy.IsMetaData(documentServiceRequest) && documentServiceRequest.IsReadOnlyRequest)
+            //Get Addresses Requests
+            if (documentServiceRequest.ResourceType == ResourceType.Address)
             {
-                return HttpTimeoutPolicyDefault.InstanceShouldThrow503OnTimeout;
+                return HttpTimeoutPolicyControlPlaneRetriableHotPath.InstanceShouldThrow503OnTimeout;
+            }
+
+            //Data Plane Operations
+            if (!HttpTimeoutPolicy.IsMetaData(documentServiceRequest))
+            {
+                if (isThinClientEnabled)
+                {
+                    if (documentServiceRequest.IsReadOnlyRequest)
+                    {
+                        return documentServiceRequest.OperationType == OperationType.Read
+                            ? HttpTimeoutPolicyForThinClient.InstanceShouldRetryAndThrow503OnTimeoutForPointReads
+                            : HttpTimeoutPolicyForThinClient.InstanceShouldRetryAndThrow503OnTimeoutForNonPointReads;
+                    }
+                    else
+                    {
+                        return HttpTimeoutPolicyForThinClient.InstanceShouldNotRetryAndThrow503OnTimeoutForWrites;
+                    }
+                }
+                // Data Plane Reads.
+                else if (documentServiceRequest.IsReadOnlyRequest)
+                {
+                    if (isPartitionLevelFailoverEnabled)
+                    {
+                        return documentServiceRequest.OperationType == OperationType.Read 
+                            ? HttpTimeoutPolicyForPartitionFailover.InstanceShouldThrow503OnTimeoutForPointReads
+                            : HttpTimeoutPolicyForPartitionFailover.InstanceShouldThrow503OnTimeoutForNonPointReads;
+                    }
+                    else
+                    {
+                         return HttpTimeoutPolicyDefault.InstanceShouldThrow503OnTimeout;
+                    }
+                }
             }
 
             //Meta Data Read
             if (HttpTimeoutPolicy.IsMetaData(documentServiceRequest) && documentServiceRequest.IsReadOnlyRequest)
             {
-                return HttpTimeoutPolicyDefault.InstanceShouldThrow503OnTimeout;
+                return HttpTimeoutPolicyControlPlaneRetriableHotPath.InstanceShouldThrow503OnTimeout;
             }
 
             //Default behavior

@@ -4,11 +4,11 @@
 
 namespace Microsoft.Azure.Cosmos.Tests.Query.Metrics
 {
-    using VisualStudio.TestTools.UnitTesting;
-    using Microsoft.Azure.Cosmos.Query.Core.Metrics;
-    using System.Collections.Generic;
     using System;
+    using System.Collections.Generic;
     using System.Linq;
+    using Microsoft.Azure.Cosmos.Query.Core.Metrics;
+    using VisualStudio.TestTools.UnitTesting;
 
     [TestClass]
     public class ClientSideMetricsTests
@@ -16,16 +16,16 @@ namespace Microsoft.Azure.Cosmos.Tests.Query.Metrics
         internal static readonly ClientSideMetrics MockClientSideMetrics = new ClientSideMetrics(
             retries: 1,
             requestCharge: 2,
-            fetchExecutionRanges: new List<FetchExecutionRange>() { new FetchExecutionRange("asdf", "asdf", default(DateTime), default(DateTime), 42, 42) });
+            fetchExecutionRanges: new List<FetchExecutionRange>() { new FetchExecutionRange("asdf", "asdf", default, default, 42, 42) });
 
         [TestMethod]
         public void TestAccumulator()
         {
-            ClientSideMetrics.Accumulator accumulator = new ClientSideMetrics.Accumulator();
-            accumulator = accumulator.Accumulate(MockClientSideMetrics);
-            accumulator = accumulator.Accumulate(MockClientSideMetrics);
+            ClientSideMetricsAccumulator accumulator = new ClientSideMetricsAccumulator();
+            accumulator.Accumulate(MockClientSideMetrics);
+            accumulator.Accumulate(MockClientSideMetrics);
 
-            ClientSideMetrics doubleMetrics = ClientSideMetrics.Accumulator.ToClientSideMetrics(accumulator);
+            ClientSideMetrics doubleMetrics = accumulator.GetClientSideMetrics();
             Assert.AreEqual(2 * MockClientSideMetrics.Retries, doubleMetrics.Retries);
             Assert.AreEqual(2 * MockClientSideMetrics.RequestCharge, doubleMetrics.RequestCharge);
             Assert.AreEqual(2 * MockClientSideMetrics.FetchExecutionRanges.Count(), doubleMetrics.FetchExecutionRanges.Count());

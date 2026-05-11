@@ -3,6 +3,7 @@
     using System;
     using System.Collections.Concurrent;
     using System.Collections.Generic;
+    using System.Globalization;
     using System.Linq;
     using System.Net;
     using System.Net.Http;
@@ -138,7 +139,7 @@
             catch (CosmosException ex)
             {
                 Assert.IsTrue(ex.StatusCode == HttpStatusCode.NotFound);
-                throw ex;
+                throw;
             }
         }
 
@@ -156,7 +157,7 @@
             catch (CosmosException ex)
             {
                 Assert.IsTrue(ex.StatusCode == HttpStatusCode.NotFound);
-                throw ex;
+                throw;
             }
         }
 
@@ -205,7 +206,7 @@
         public async Task CreateAndInitializeAsync_WithValidDatabaseAndContainer_ShouldOpenRntbdConnectionsToBackendReplicas()
         {
             // Arrange.
-            int httpCallsMade = 0;
+            int httpCallsMade = 0, maxRequestsPerConnection = 6;
             HttpClientHandlerHelper httpClientHandlerHelper = new ()
             {
                 RequestCallBack = (request, cancellationToken) =>
@@ -227,6 +228,7 @@
             {
                 HttpClientFactory = () => new HttpClient(httpClientHandlerHelper),
                 ConnectionMode = ConnectionMode.Direct,
+                MaxRequestsPerTcpConnection = maxRequestsPerConnection,
             };
 
             // Act.
@@ -275,8 +277,10 @@
                                     .GetValue(loadBalancingPartition);
 
             Assert.IsNotNull(openChannels);
-            Assert.AreEqual(30, channelCapacity);
-            Assert.AreEqual(1, openChannels.Count);
+            Assert.AreEqual(1, openChannels.Count, "Here the expected value 1 explains how many TCP connections were opened by the LoadBalancingPartition.OpenChannelAsync()." +
+                "The emulator by default returns 12 partitions, and each partition has 4 replicas, and by behavior the emulator uses the same URI for each of these replica," +
+                "hence 12 * 4 = 48 times we call the OpenChannelAsync(). However, the number of TCP connections established would be just one per each unique endpoint.");
+            Assert.AreEqual(openChannels.Count * maxRequestsPerConnection, channelCapacity);
 
             Documents.Rntbd.LbChannelState channelState = openChannels.First();
 
@@ -360,6 +364,106 @@
             // Assert.
             Assert.IsNotNull(ce);
             Assert.AreEqual(HttpStatusCode.NotFound, ce.StatusCode);
+        }
+
+        /// <summary>
+        /// Test to validate write item operations with transport interceptor that modifies
+        /// GlobalNRegionCommittedGLSN header and HTTP interceptor that sets EnableNRegionSynchronousCommit
+        /// in AccountProperties response.
+        /// </summary>
+        [TestMethod]
+        [Owner("aavasthy")]
+        public async Task CreateAndInitializeAsync_WriteItemOperationWithNRegionCommitTest()
+        {
+            // Custom GlobalNRegionCommittedGLSN value to inject
+            const long customGlobalNRegionCommittedGLSN = 100;
+
+            // HTTP handler to intercept AccountProperties response and set EnableNRegionSynchronousCommit = true
+            HttpClientHandlerHelper httpClientHandlerHelper = new HttpClientHandlerHelper
+            {
+                ResponseIntercepter = async (response, request) =>
+                {
+                    if (request.RequestUri.AbsolutePath.EndsWith("/", StringComparison.OrdinalIgnoreCase) ||
+                        request.RequestUri.AbsolutePath.Equals(string.Empty))
+                    {
+                        if (response.IsSuccessStatusCode)
+                        {
+                            string content = await response.Content.ReadAsStringAsync();
+                            Newtonsoft.Json.Linq.JObject accountJson = Newtonsoft.Json.Linq.JObject.Parse(content);
+
+                            accountJson[Constants.Properties.EnableNRegionSynchronousCommit] = true;
+
+                            string modifiedContent = accountJson.ToString();
+                            response.Content = new StringContent(modifiedContent, System.Text.Encoding.UTF8, "application/json");
+                        }
+                    }
+                    return response;
+                }
+            };
+
+            await this.TestInit(
+                customizeClientBuilder: (builder) =>
+                {
+                    builder.WithConnectionModeDirect();
+                    builder.WithHttpClientFactory(() => new HttpClient(httpClientHandlerHelper));
+                    builder.WithTransportClientHandlerFactory(transportClient =>
+                        new TransportClientHelper.TransportClientWrapper(
+                            client: transportClient,
+                            interceptorAfterResult: (request, storeResponse) =>
+                            {
+                                // Override GlobalNRegionCommittedGLSN header in the response for Document operations
+                                if (request.ResourceType == ResourceType.Document)
+                                {
+                                    storeResponse.Headers.Set(
+                                        WFConstants.BackendHeaders.GlobalNRegionCommittedGLSN,
+                                        customGlobalNRegionCommittedGLSN.ToString(CultureInfo.InvariantCulture));
+                                }
+                                return storeResponse;
+                            }));
+                });
+
+            string containerName = "NRegionCommitTestContainer_" + Guid.NewGuid().ToString("N");
+            ContainerResponse containerResponse = await this.database.CreateContainerAsync(
+                new ContainerProperties(id: containerName, partitionKeyPath: PartitionKey),
+                cancellationToken: this.cancellationToken);
+            Assert.IsNotNull(containerResponse);
+
+            Container container = containerResponse.Container;
+
+            try
+            {
+                for (int i = 0; i < 2; i++)
+                {
+                    ToDoActivity item = new()
+                    {
+                        id = Guid.NewGuid().ToString(),
+                        pk = "testPartition",
+                        description = $"Test item {i}",
+                    };
+
+                    // Act
+                    ItemResponse<ToDoActivity> writeResponse = await container.CreateItemAsync(
+                        item: item,
+                        partitionKey: new Cosmos.PartitionKey(item.pk));
+
+                    // Assert
+                    Assert.AreEqual(HttpStatusCode.Created, writeResponse.StatusCode);
+
+                    // Assert: Verify GlobalNRegionCommittedGLSN is present in diagnostics with value 100
+                    string diagnostics = writeResponse.Diagnostics.ToString();
+
+                    Assert.IsTrue(
+                        diagnostics.Contains($"\"GlobalNRegionCommittedGLSN\":{customGlobalNRegionCommittedGLSN}") ||
+                        diagnostics.Contains($"\"GlobalNRegionCommittedGLSN\": {customGlobalNRegionCommittedGLSN}"),
+                        $"Expected GlobalNRegionCommittedGLSN to be {customGlobalNRegionCommittedGLSN} in diagnostics. Actual diagnostics: {diagnostics}");
+
+                }
+            }
+            finally
+            {
+                // Cleanup: Delete the test container
+                await container.DeleteContainerAsync();
+            }
         }
     }
 }

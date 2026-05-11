@@ -28,6 +28,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 AllowBulkExecution = true
             };
             this.client = TestCommon.CreateCosmosClient(clientOptions);
+            await Util.DeleteAllDatabasesAsync(this.client);
 
             DatabaseResponse response = await this.client.CreateDatabaseIfNotExistsAsync(Guid.NewGuid().ToString());
             this.database = response.Database;
@@ -96,6 +97,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 Assert.IsTrue(result.Headers.RequestCharge > 0);
                 Assert.IsNotNull(result.Headers.Session);
                 Assert.IsNotNull(result.Headers.ActivityId);
+                Assert.IsNotNull(result.Headers.PartitionKeyRangeId);
                 Assert.IsFalse(string.IsNullOrEmpty(result.Diagnostics.ToString()));
                 ToDoActivity document = TestCommon.SerializerCore.FromStream<ToDoActivity>(result.Content);
                 Assert.AreEqual(i.ToString(), document.id);
@@ -120,6 +122,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 Assert.IsTrue(result.Headers.RequestCharge > 0);
                 Assert.IsNotNull(result.Headers.Session);
                 Assert.IsNotNull(result.Headers.ActivityId);
+                Assert.IsNotNull(result.Headers.PartitionKeyRangeId);
                 Assert.IsFalse(string.IsNullOrEmpty(result.Diagnostics.ToString()));
                 Assert.AreEqual(HttpStatusCode.Created, result.StatusCode);
             }
@@ -197,6 +200,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 Task<ItemResponse<ToDoActivity>> task = tasks[i];
                 ItemResponse<ToDoActivity> result = await task;
                 Assert.IsTrue(result.Headers.RequestCharge > 0);
+                Assert.IsNotNull(result.Headers.PartitionKeyRangeId);
                 Assert.IsFalse(string.IsNullOrEmpty(result.Diagnostics.ToString()));
                 Assert.AreEqual(HttpStatusCode.Created, result.StatusCode);
             }
@@ -228,6 +232,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 Task<ItemResponse<ToDoActivity>> task = tasks[i];
                 ItemResponse<ToDoActivity> result = await task;
                 Assert.IsTrue(result.Headers.RequestCharge > 0);
+                Assert.IsNotNull(result.Headers.PartitionKeyRangeId);
                 Assert.IsFalse(string.IsNullOrEmpty(result.Diagnostics.ToString()));
                 Assert.AreEqual(HttpStatusCode.Created, result.StatusCode);
             }
@@ -251,6 +256,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 Assert.IsTrue(result.Headers.RequestCharge > 0);
                 Assert.IsNotNull(result.Headers.Session);
                 Assert.IsNotNull(result.Headers.ActivityId);
+                Assert.IsNotNull(result.Headers.PartitionKeyRangeId);
                 Assert.IsFalse(string.IsNullOrEmpty(result.Diagnostics.ToString()));
                 Assert.AreEqual(HttpStatusCode.Created, result.StatusCode);
             }
@@ -275,6 +281,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 Assert.IsTrue(result.Headers.RequestCharge > 0);
                 Assert.IsNotNull(result.Headers.Session);
                 Assert.IsNotNull(result.Headers.ActivityId);
+                Assert.IsNotNull(result.Headers.PartitionKeyRangeId);
                 Assert.IsFalse(string.IsNullOrEmpty(result.Diagnostics.ToString()));
                 ToDoActivity document = TestCommon.SerializerCore.FromStream<ToDoActivity>(result.Content);
                 Assert.AreEqual(i.ToString(), document.id);
@@ -299,6 +306,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 Assert.IsTrue(result.Headers.RequestCharge > 0);
                 Assert.IsNotNull(result.Headers.Session);
                 Assert.IsNotNull(result.Headers.ActivityId);
+                Assert.IsNotNull(result.Headers.PartitionKeyRangeId);
                 Assert.IsFalse(string.IsNullOrEmpty(result.Diagnostics.ToString()));
                 Assert.AreEqual(HttpStatusCode.Created, result.StatusCode);
             }
@@ -334,6 +342,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 Assert.IsTrue(result.Headers.RequestCharge > 0);
                 Assert.IsNotNull(result.Headers.Session);
                 Assert.IsNotNull(result.Headers.ActivityId);
+                Assert.IsNotNull(result.Headers.PartitionKeyRangeId);
                 Assert.IsFalse(string.IsNullOrEmpty(result.Diagnostics.ToString()));
                 Assert.AreEqual(HttpStatusCode.NoContent, result.StatusCode);
             }
@@ -369,6 +378,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 Assert.IsTrue(result.Headers.RequestCharge > 0);
                 Assert.IsNotNull(result.Headers.Session);
                 Assert.IsNotNull(result.Headers.ActivityId);
+                Assert.IsNotNull(result.Headers.PartitionKeyRangeId);
                 Assert.IsFalse(string.IsNullOrEmpty(result.Diagnostics.ToString()));
                 Assert.AreEqual(HttpStatusCode.NoContent, result.StatusCode);
             }
@@ -404,6 +414,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 Assert.IsTrue(result.Headers.RequestCharge > 0);
                 Assert.IsNotNull(result.Headers.Session);
                 Assert.IsNotNull(result.Headers.ActivityId);
+                Assert.IsNotNull(result.Headers.PartitionKeyRangeId);
                 Assert.IsFalse(string.IsNullOrEmpty(result.Diagnostics.ToString()));
                 Assert.AreEqual(HttpStatusCode.OK, result.StatusCode);
             }
@@ -439,6 +450,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 Assert.IsTrue(result.Headers.RequestCharge > 0);
                 Assert.IsNotNull(result.Headers.Session);
                 Assert.IsNotNull(result.Headers.ActivityId);
+                Assert.IsNotNull(result.Headers.PartitionKeyRangeId);
                 Assert.IsFalse(string.IsNullOrEmpty(result.Diagnostics.ToString()));
                 Assert.AreEqual(HttpStatusCode.OK, result.StatusCode);
             }
@@ -474,6 +486,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 Assert.IsTrue(result.Headers.RequestCharge > 0);
                 Assert.IsNotNull(result.Headers.Session);
                 Assert.IsNotNull(result.Headers.ActivityId);
+                Assert.IsNotNull(result.Headers.PartitionKeyRangeId);
                 Assert.IsFalse(string.IsNullOrEmpty(result.Diagnostics.ToString()));
                 Assert.AreEqual(HttpStatusCode.OK, result.StatusCode);
             }
@@ -509,6 +522,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 Assert.IsTrue(result.Headers.RequestCharge > 0);
                 Assert.IsNotNull(result.Headers.Session);
                 Assert.IsNotNull(result.Headers.ActivityId);
+                Assert.IsNotNull(result.Headers.PartitionKeyRangeId);
                 Assert.IsFalse(string.IsNullOrEmpty(result.Diagnostics.ToString()));
                 Assert.AreEqual(HttpStatusCode.OK, result.StatusCode);
             }
@@ -548,6 +562,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 Assert.IsTrue(result.Headers.RequestCharge > 0);
                 Assert.IsNotNull(result.Headers.Session);
                 Assert.IsNotNull(result.Headers.ActivityId);
+                Assert.IsNotNull(result.Headers.PartitionKeyRangeId);
                 Assert.IsFalse(string.IsNullOrEmpty(result.Diagnostics.ToString()));
                 Assert.AreEqual(HttpStatusCode.OK, result.StatusCode);
             }
@@ -587,6 +602,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 Assert.IsTrue(result.Headers.RequestCharge > 0);
                 Assert.IsNotNull(result.Headers.Session);
                 Assert.IsNotNull(result.Headers.ActivityId);
+                Assert.IsNotNull(result.Headers.PartitionKeyRangeId);
                 Assert.IsFalse(string.IsNullOrEmpty(result.Diagnostics.ToString()));
                 Assert.AreEqual(HttpStatusCode.OK, result.StatusCode);
                 Assert.AreEqual("patched", result.Resource.description);
@@ -630,6 +646,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                     Assert.IsTrue(result.Headers.RequestCharge > 0);
                     Assert.IsNotNull(result.Headers.Session);
                     Assert.IsNotNull(result.Headers.ActivityId);
+                    Assert.IsNotNull(result.Headers.PartitionKeyRangeId);
                     Assert.IsFalse(string.IsNullOrEmpty(result.Diagnostics.ToString()));
                     Assert.AreEqual(HttpStatusCode.Created, result.StatusCode);
                 }

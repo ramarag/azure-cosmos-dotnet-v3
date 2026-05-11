@@ -23,7 +23,7 @@
     public class Program
     {
         // <Main>
-        public static void Main(string[] args)
+        public static void Main(string[] _)
         {
             try
             {
@@ -130,10 +130,7 @@
             {
                 // <IHttpClientFactoryConsole>
                 IHostBuilder builder = new HostBuilder()
-                    .ConfigureServices((hostContext, services) =>
-                    {
-                        services.AddHttpClient();
-                    }).UseConsoleLifetime();
+                    .ConfigureServices((hostContext, services) => services.AddHttpClient()).UseConsoleLifetime();
 
                 IHost host = builder.Build();
 
@@ -158,6 +155,7 @@
             //ASP.NET Core applications get it from the Dependency Injection container.
             {
                 // <IHttpClientFactoryASPNETCore>
+#pragma warning disable CS8321
                 void ConfigureServices(IServiceCollection services)
                 {
                     services.AddHttpClient();
@@ -176,7 +174,8 @@
 
                     //... other service registration
                 }
-                // </IHttpClientFactoryASPNETCore>
+#pragma warning restore CS8321
+                              // </IHttpClientFactoryASPNETCore>
             }
         }
 
@@ -190,9 +189,15 @@
         {
             // <ReusingHandler>
             // Maintain a single instance of the SocketsHttpHandler for the lifetime of the application
-            SocketsHttpHandler socketsHttpHandler = new SocketsHttpHandler();
-            socketsHttpHandler.PooledConnectionLifetime = TimeSpan.FromMinutes(10); // Customize this value based on desired DNS refresh timer
-            socketsHttpHandler.MaxConnectionsPerServer = 20; // Customize the maximum number of allowed connections
+            SocketsHttpHandler socketsHttpHandler = new SocketsHttpHandler
+            {
+                PooledConnectionLifetime = TimeSpan.FromMinutes(10), // Customize this value based on desired DNS refresh timer
+                MaxConnectionsPerServer = 20, // Customize the maximum number of allowed connections
+                EnableMultipleHttp2Connections = true, // Recommended for thin client (HTTP/2) mode to open additional connections when stream limits are reached
+                KeepAlivePingDelay = TimeSpan.FromSeconds(1), // Send HTTP/2 PING after 1s of inactivity to detect broken connections
+                KeepAlivePingTimeout = TimeSpan.FromSeconds(2), // Mark connection dead if no PONG within 2s
+                KeepAlivePingPolicy = HttpKeepAlivePingPolicy.Always 
+            };
 
             CosmosClientOptions cosmosClientOptions = new CosmosClientOptions()
             {

@@ -6,12 +6,17 @@ namespace CosmosBenchmark
 {
     using System;
     using System.Collections.Generic;
+    using System.Diagnostics;
     using System.Linq;
     using System.Runtime;
     using CommandLine;
+    using Microsoft.Azure.Cosmos.Telemetry;
     using Microsoft.Azure.Documents.Client;
     using Newtonsoft.Json;
 
+    /// <summary>
+    /// Represents Benchmark Configuration
+    /// </summary>
     public class BenchmarkConfig
     {
         private static readonly string UserAgentSuffix = "cosmosdbdotnetbenchmark";
@@ -25,6 +30,20 @@ namespace CosmosBenchmark
         [Option('k', Required = true, HelpText = "Cosmos account master key")]
         [JsonIgnore]
         public string Key { get; set; }
+
+        [Option("isthinclientenabled", Required = false, HelpText = "ThinClient enabled")]
+        public string IsThinClientEnabledRaw { get; set; }
+        public bool IsThinClientEnabled => string.Equals(this.IsThinClientEnabledRaw, "true", StringComparison.OrdinalIgnoreCase);
+
+        [Option("isgatewaymodeenabled", Required = false, HelpText = "Gateway mode enabled")]
+        public string IsGatewayModeEnabledRaw { get; set; }
+        public bool IsGatewayModeEnabled => string.Equals(this.IsGatewayModeEnabledRaw, "true", StringComparison.OrdinalIgnoreCase);
+
+        [Option("isdirectmodeenabled", Required = false, HelpText = "Direct mode enabled")]
+        public string IsDirectModeEnabledRaw { get; set; }
+        public bool IsDirectModeEnabled => string.Equals(this.IsDirectModeEnabledRaw, "true", StringComparison.OrdinalIgnoreCase);
+
+
 
         [Option(Required = false, HelpText = "Workload Name, it will override the workloadType value in published results")]
         public string WorkloadName { get; set; }
@@ -98,17 +117,11 @@ namespace CosmosBenchmark
         [Option(Required = false, HelpText = "Disable core SDK logging")]
         public bool DisableCoreSdkLogging { get; set; }
 
-        [Option(Required = false, HelpText = "Enable Client Telemetry")]
-        public bool EnableTelemetry { get; set; }
-
         [Option(Required = false, HelpText = "Enable Distributed Tracing")]
-        public bool EnableDistributedTracing { get; set; }
+        public bool EnableDistributedTracing { get; set; } = false;
 
         [Option(Required = false, HelpText = "Client Telemetry Schedule in Seconds")]
         public int  TelemetryScheduleInSec { get; set; }
-
-        [Option(Required = false, HelpText = "Client Telemetry Endpoint")]
-        public string TelemetryEndpoint { get; set; }
 
         [Option(Required = false, HelpText = "Endpoint to publish results to")]
         public string ResultsEndpoint { get; set; }
@@ -122,6 +135,28 @@ namespace CosmosBenchmark
 
         [Option(Required = false, HelpText = "Container to publish results to")]
         public string ResultsContainer { get; set; } = "runsummary";
+        
+        [Option(Required = false, HelpText = "Request latency threshold for capturing diagnostic data")]
+        public int DiagnosticLatencyThresholdInMs { get; set; } = 100;
+
+        [Option(Required = false, HelpText = "Blob storage account connection string")]
+        [JsonIgnore]
+        public string DiagnosticsStorageConnectionString { get; set; }
+
+        [Option(Required = false, HelpText = "Blob storage container folder prefix")]
+        public string DiagnosticsStorageContainerPrefix { get; set; }
+
+        [Option(Required = false, HelpText = "Metrics reporting interval in seconds")]
+        public int MetricsReportingIntervalInSec { get; set; } = 5;
+
+        [Option(Required = false, HelpText = "Application Insights connection string")]
+        public string AppInsightsConnectionString { get; set; }
+
+        [Option(Required = false, HelpText = "Enable Client Telemetry Feature in SDK. Make sure you enable it from the portal also.")]
+        public bool EnableTelemetry { get; set; } = false;
+
+        [Option(Required = false, HelpText = "List of comma separated preferred regions.")]
+        public string ApplicationPreferredRegions { get; set; } = null;
 
         internal int GetTaskCount(int containerThroughput)
         {
@@ -188,35 +223,32 @@ namespace CosmosBenchmark
             return this.WorkloadName ?? this.WorkloadType ?? BenchmarkConfig.UserAgentSuffix;
         }
 
-        internal Microsoft.Azure.Cosmos.CosmosClient CreateCosmosClient(string accountKey)
+        internal Microsoft.Azure.Cosmos.CosmosClient CreateCosmosClient()
         {
+            // Overwrite the default timespan if configured
+            if(this.TelemetryScheduleInSec > 0)
+            {
+                ClientTelemetryOptions.DefaultIntervalForTelemetryJob = TimeSpan.FromSeconds(this.TelemetryScheduleInSec);
+            }
+
             Microsoft.Azure.Cosmos.CosmosClientOptions clientOptions = new Microsoft.Azure.Cosmos.CosmosClientOptions()
             {
                 ApplicationName = this.GetUserAgentPrefix(),
                 MaxRetryAttemptsOnRateLimitedRequests = 0,
                 MaxRequestsPerTcpConnection = this.MaxRequestsPerTcpConnection,
-                MaxTcpConnectionsPerEndpoint = this.MaxTcpConnectionsPerEndpoint
+                MaxTcpConnectionsPerEndpoint = this.MaxTcpConnectionsPerEndpoint,
+                ConnectionMode = (this.IsThinClientEnabled || this.IsGatewayModeEnabled) ? Microsoft.Azure.Cosmos.ConnectionMode.Gateway: Microsoft.Azure.Cosmos.ConnectionMode.Direct,
+                CosmosClientTelemetryOptions = new Microsoft.Azure.Cosmos.CosmosClientTelemetryOptions()
+                {
+                    DisableSendingMetricsToService = !this.EnableTelemetry,
+                    DisableDistributedTracing = !this.EnableDistributedTracing
+                },
             };
 
-            if (this.EnableTelemetry)
+            if (!string.IsNullOrEmpty(this.ApplicationPreferredRegions))
             {
-                Environment.SetEnvironmentVariable(
-                    Microsoft.Azure.Cosmos.Telemetry.ClientTelemetryOptions.EnvPropsClientTelemetryEnabled, 
-                    "true");
-
-                if (this.TelemetryScheduleInSec > 0)
-                {
-                    Environment.SetEnvironmentVariable(
-                        Microsoft.Azure.Cosmos.Telemetry.ClientTelemetryOptions.EnvPropsClientTelemetrySchedulingInSeconds, 
-                        Convert.ToString(this.TelemetryScheduleInSec));
-                }
-
-                if (!string.IsNullOrEmpty(this.TelemetryEndpoint))
-                {
-                    Environment.SetEnvironmentVariable(
-                        Microsoft.Azure.Cosmos.Telemetry.ClientTelemetryOptions.EnvPropsClientTelemetryEndpoint, 
-                        this.TelemetryEndpoint);
-                }
+                clientOptions.ApplicationPreferredRegions = this.ApplicationPreferredRegions.Split(',')
+                    .Select(region => region.Trim()).ToArray();
             }
 
             if (!string.IsNullOrWhiteSpace(this.ConsistencyLevel))
@@ -224,11 +256,9 @@ namespace CosmosBenchmark
                 clientOptions.ConsistencyLevel = (Microsoft.Azure.Cosmos.ConsistencyLevel)Enum.Parse(typeof(Microsoft.Azure.Cosmos.ConsistencyLevel), this.ConsistencyLevel, ignoreCase: true);
             }
 
-            clientOptions.IsDistributedTracingEnabled = this.EnableDistributedTracing;
-
             return new Microsoft.Azure.Cosmos.CosmosClient(
                         this.EndPoint,
-                        accountKey,
+                        this.Key,
                         clientOptions);
         }
 
@@ -263,7 +293,7 @@ namespace CosmosBenchmark
             {
                 foreach (Error e in errors)
                 {
-                    Console.WriteLine(e.ToString());
+                    Trace.TraceInformation(e.ToString());
                 }
             }
 

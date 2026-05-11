@@ -25,19 +25,11 @@ namespace Microsoft.Azure.Cosmos
 
         public override string TimeoutPolicyName => HttpTimeoutPolicyControlPlaneRead.Name;
 
-        public override TimeSpan MaximumRetryTimeLimit => CosmosHttpClient.GatewayRequestTimeout;
-
         public override int TotalRetryCount => this.TimeoutsAndDelays.Count;
 
         public override IEnumerator<(TimeSpan requestTimeout, TimeSpan delayForNextRequest)> GetTimeoutEnumerator()
         {
             return this.TimeoutsAndDelays.GetEnumerator();
-        }
-
-        // This is for control plane reads which should always be safe to retry on.
-        public override bool IsSafeToRetry(HttpMethod httpMethod)
-        {
-            return true;
         }
 
         public override bool ShouldRetryBasedOnResponse(HttpMethod requestHttpMethod, HttpResponseMessage responseMessage)

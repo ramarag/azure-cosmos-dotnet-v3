@@ -4,9 +4,7 @@
 
 namespace Microsoft.Azure.Cosmos
 {
-    using System;
     using System.Collections.Generic;
-    using System.Collections.Specialized;
     using Microsoft.Azure.Documents.Collections;
 
     /// <summary>
@@ -46,6 +44,12 @@ namespace Microsoft.Azure.Cosmos
             set => this.requestNameValueCollection.XDate = value;
         }
 
+        public override string OptimisticDirectExecute
+        {
+            get => this.requestNameValueCollection.OptimisticDirectExecute;
+            set => this.requestNameValueCollection.OptimisticDirectExecute = value;
+        }
+
         public override string ConsistencyLevel
         {
             get => this.requestNameValueCollection.ConsistencyLevel;
@@ -68,6 +72,12 @@ namespace Microsoft.Azure.Cosmos
         {
             get => this.requestNameValueCollection.ContentSerializationFormat;
             set => this.requestNameValueCollection.ContentSerializationFormat = value;
+        }
+
+        public override string SupportedSerializationFormats
+        {
+            get => this.requestNameValueCollection.SupportedSerializationFormats;
+            set => this.requestNameValueCollection.SupportedSerializationFormats = value;
         }
 
         public override string ReadFeedKeyType

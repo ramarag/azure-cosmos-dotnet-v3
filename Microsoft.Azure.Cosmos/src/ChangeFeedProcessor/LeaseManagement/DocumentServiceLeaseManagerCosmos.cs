@@ -31,6 +31,8 @@ namespace Microsoft.Azure.Cosmos.ChangeFeed.LeaseManagement
         private readonly AsyncLazy<TryCatch<string>> lazyContainerRid;
         private PartitionKeyRangeCache partitionKeyRangeCache;
 
+        internal static bool IsChangeFeedLeaseIdAsPartitionKeyEnabled = ConfigurationManager.IsChangeFeedLeaseIdAsPartitionKeyEnabled();
+
         public DocumentServiceLeaseManagerCosmos(
             ContainerInternal monitoredContainer,
             ContainerInternal leaseContainer,
@@ -124,10 +126,13 @@ namespace Microsoft.Azure.Cosmos.ChangeFeed.LeaseManagement
                 LeaseId = leaseDocId,
                 LeaseToken = leaseToken,
                 ContinuationToken = continuationToken,
-                FeedRange = new FeedRangeEpk(partitionKeyRange.ToRange())
+                FeedRange = new FeedRangeEpk(partitionKeyRange.ToRange()),
+                Mode = this.GetChangeFeedMode()
             };
 
-            this.requestOptionsFactory.AddPartitionKeyIfNeeded((string pk) => documentServiceLease.LeasePartitionKey = pk, Guid.NewGuid().ToString());
+            this.requestOptionsFactory.AddPartitionKeyIfNeeded(
+                (string pk) => documentServiceLease.LeasePartitionKey = pk,
+                DocumentServiceLeaseManagerCosmos.GetLeasePartitionKeyValue(documentServiceLease.LeaseId));
 
             return this.TryCreateDocumentServiceLeaseAsync(documentServiceLease);
         }
@@ -148,12 +153,29 @@ namespace Microsoft.Azure.Cosmos.ChangeFeed.LeaseManagement
                 LeaseId = leaseDocId,
                 LeaseToken = leaseToken,
                 ContinuationToken = continuationToken,
-                FeedRange = feedRange
+                FeedRange = feedRange,
+                Mode = this.GetChangeFeedMode()
             };
 
-            this.requestOptionsFactory.AddPartitionKeyIfNeeded((string pk) => documentServiceLease.LeasePartitionKey = pk, Guid.NewGuid().ToString());
+            this.requestOptionsFactory.AddPartitionKeyIfNeeded(
+                (string pk) => documentServiceLease.LeasePartitionKey = pk,
+                DocumentServiceLeaseManagerCosmos.GetLeasePartitionKeyValue(documentServiceLease.LeaseId));
 
             return this.TryCreateDocumentServiceLeaseAsync(documentServiceLease);
+        }
+
+        private static string GetLeasePartitionKeyValue(string leaseId)
+        {
+            return DocumentServiceLeaseManagerCosmos.IsChangeFeedLeaseIdAsPartitionKeyEnabled
+                ? leaseId
+                : Guid.NewGuid().ToString();
+        }
+
+        private string GetChangeFeedMode()
+        {
+            return this.options.Mode == ChangeFeedMode.AllVersionsAndDeletes
+                ? HttpConstants.A_IMHeaderValues.FullFidelityFeed
+                : HttpConstants.A_IMHeaderValues.IncrementalFeed;
         }
 
         public override async Task ReleaseAsync(DocumentServiceLease lease)

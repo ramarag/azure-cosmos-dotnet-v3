@@ -2,10 +2,9 @@
 // Copyright (c) Microsoft Corporation.  All rights reserved.
 //------------------------------------------------------------
 
-using System.Net.Http;
-
 namespace Microsoft.Azure.Cosmos.Tests
 {
+    using System.Net.Http;
     using System;
     using System.Collections.Generic;
     using System.Collections.ObjectModel;
@@ -34,16 +33,18 @@ namespace Microsoft.Azure.Cosmos.Tests
             Cosmos.ConsistencyLevel? accountConsistencyLevel = null,
             bool enableTelemetry = false)
         {
-            DocumentClient documentClient = accountConsistencyLevel.HasValue ? new MockDocumentClient(accountConsistencyLevel.Value) : new MockDocumentClient();
-            CosmosClientBuilder cosmosClientBuilder = new CosmosClientBuilder("http://localhost", MockCosmosUtil.RandomInvalidCorrectlyFormatedAuthKey);
-            customizeClientBuilder?.Invoke(cosmosClientBuilder);
-            if(enableTelemetry)
+            ConnectionPolicy policy = new ConnectionPolicy
             {
-                documentClient.clientTelemetry = new Mock<ClientTelemetry>().Object;
+                CosmosClientTelemetryOptions = new CosmosClientTelemetryOptions
+                {
+                    DisableSendingMetricsToService = !enableTelemetry
+                }
+            };
 
-                cosmosClientBuilder.WithTelemetryEnabled();
-            }
+            DocumentClient documentClient = accountConsistencyLevel.HasValue ? new MockDocumentClient(accountConsistencyLevel.Value, policy) : new MockDocumentClient(policy);
+            CosmosClientBuilder cosmosClientBuilder = new CosmosClientBuilder("http://localhost", MockCosmosUtil.RandomInvalidCorrectlyFormatedAuthKey);
 
+            customizeClientBuilder?.Invoke(cosmosClientBuilder);
             return cosmosClientBuilder.Build(documentClient);
         }
 
@@ -75,10 +76,7 @@ namespace Microsoft.Azure.Cosmos.Tests
             Func<HttpClient> httpClient,
             DocumentClientEventSource eventSource = null)
         {
-            if (eventSource == null)
-            {
-                eventSource = DocumentClientEventSource.Instance;
-            }
+            eventSource ??= DocumentClientEventSource.Instance;
 
             ConnectionPolicy connectionPolicy = new ConnectionPolicy()
             {
@@ -92,6 +90,30 @@ namespace Microsoft.Azure.Cosmos.Tests
                 httpMessageHandler: null,
                 sendingRequestEventArgs: null,
                 receivedResponseEventArgs: null);
+        }
+
+        public static CosmosHttpClient CreateMockCosmosHttpClientFromFunc(
+            Func<HttpRequestMessage, Task<HttpResponseMessage>> sendFunc)
+        {
+            return MockCosmosUtil.CreateCosmosHttpClient(
+                () => new HttpClient(new DelegatingHttpHandler(sendFunc)));
+        }
+
+        private class DelegatingHttpHandler : HttpMessageHandler
+        {
+            private readonly Func<HttpRequestMessage, Task<HttpResponseMessage>> sendFunc;
+
+            public DelegatingHttpHandler(Func<HttpRequestMessage, Task<HttpResponseMessage>> sendFunc)
+            {
+                this.sendFunc = sendFunc;
+            }
+
+            protected override Task<HttpResponseMessage> SendAsync(
+                HttpRequestMessage request,
+                CancellationToken cancellationToken)
+            {
+                return this.sendFunc(request);
+            }
         }
 
         public static Mock<PartitionRoutingHelper> GetPartitionRoutingHelperMock(string partitionRangeKeyId)
@@ -126,12 +148,12 @@ namespace Microsoft.Azure.Cosmos.Tests
             List<Address> addresses = new List<Address>();
             for (int i = 0; i < physicalUris.Count; i++)
             {
-                addresses.Add(new Address() 
-                { 
-                    IsPrimary = i == 0, 
-                    PhysicalUri = physicalUris[i], 
-                    Protocol = RuntimeConstants.Protocols.RNTBD, 
-                    PartitionKeyRangeId = "YxM9ANCZIwABAAAAAAAAAA==" 
+                addresses.Add(new Address()
+                {
+                    IsPrimary = i == 0,
+                    PhysicalUri = physicalUris[i],
+                    Protocol = RuntimeConstants.Protocols.RNTBD,
+                    PartitionKeyRangeId = "YxM9ANCZIwABAAAAAAAAAA=="
                 });
             };
 

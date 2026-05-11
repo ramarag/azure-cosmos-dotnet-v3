@@ -25,5 +25,12 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
             get;
             set;
         }
+
+        [JsonProperty(Constants.Properties.HybridSearchQueryInfo)]
+        public HybridSearchQueryInfo HybridSearchQueryInfo
+        {
+            get;
+            set;
+        }
     }
 }

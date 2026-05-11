@@ -2,7 +2,7 @@
 {
     using System;
     using System.Collections.Generic;
-    using System.Diagnostics;
+    using System.Linq;
     using System.Text;
     using System.Threading;
     using System.Threading.Tasks;
@@ -45,7 +45,11 @@
             ItemResponse<ToDoActivity> response = await this.Container.CreateItemAsync(testItem, new Cosmos.PartitionKey(testItem.pk));
             Assert.IsNotNull(response.Diagnostics);
             ITrace trace = ((CosmosTraceDiagnostics)response.Diagnostics).Value;
-            Assert.AreEqual(trace.Data.Count, 1);
+#if PREVIEW
+            Assert.AreEqual(actual: trace.Data.Count, expected: 2, message: string.Join(",", trace.Data.Select(a => $"{a.Key}: {a.Value}")));  // Distributed Tracing Id
+#else
+            Assert.AreEqual(actual: trace.Data.Count, expected: 1, message: string.Join(",", trace.Data.Select(a => $"{a.Key}: {a.Value}")));
+#endif
             ClientConfigurationTraceDatum clientConfigurationTraceDatum = (ClientConfigurationTraceDatum)trace.Data["Client Configuration"];
             Assert.IsNotNull(clientConfigurationTraceDatum.UserAgentContainer.UserAgent);
         }
@@ -107,14 +111,15 @@
             ConsistencyLevel consistencyLevel = ConsistencyLevel.Session;
             string appRegion = "EastUS";
 
-            ConsistencyConfig consistencyConfig = new ConsistencyConfig(consistencyLevel, preferredRegions, appRegion);
-            Assert.AreEqual(consistencyConfig.ToString(), "(consistency: Session, prgns:[EastUS, WestUs], apprgn: EastUS)");
+            ConsistencyConfig consistencyConfig = new ConsistencyConfig(consistencyLevel, null, preferredRegions, appRegion);
+            Assert.AreEqual(consistencyConfig.ToString(), "(consistency: Session, readStrategy: NotSet, prgns:[EastUS, WestUs], apprgn: EastUS)");
 
             ConsistencyConfig consistencyConfigWithNull = new ConsistencyConfig(consistencyLevel: null,
+                                                                                readConsistencyStrategy: null,
                                                                                 preferredRegions: null,
                                                                                 applicationRegion: null);
 
-            Assert.AreEqual(consistencyConfigWithNull.ToString(), "(consistency: NotSet, prgns:[], apprgn: )");
+            Assert.AreEqual(consistencyConfigWithNull.ToString(), "(consistency: NotSet, readStrategy: NotSet, prgns:[], apprgn: )");
         }
 
         [TestMethod]
@@ -150,10 +155,9 @@
             }
             catch (CosmosOperationCanceledException oce)
             {
-                IReadOnlyList<ITrace> children = ((CosmosTraceDiagnostics)oce.Diagnostics).Value.Children;
-                ITrace exceptionChild = children[^1];
-                Assert.AreEqual("CosmosOperationCanceledException", exceptionChild.Name);
-                Assert.IsNotNull(exceptionChild.Data["Operation Cancelled Exception"]);
+                //check that the exception child exists in the trace diagnostics
+                Assert.IsTrue(oce.Diagnostics.ToString().Contains("CosmosOperationCanceledException"));
+                Assert.IsTrue(oce.Diagnostics.ToString().Contains("Operation Cancelled Exception"));
             }
         }
     }

@@ -45,15 +45,16 @@ namespace Microsoft.Azure.Cosmos.Linq
         /// <param name="prefix">Prefix for the parameter name.</param>
         /// <param name="type">Parameter type.</param>
         /// <param name="inScope">Names to avoid.</param>
+        /// <param name="includeSuffix">Enable suffix to parameter name</param>
         /// <returns>The new parameter.</returns>
-        public static ParameterExpression NewParameter(string prefix, Type type, HashSet<ParameterExpression> inScope)
+        public static ParameterExpression NewParameter(string prefix, Type type, HashSet<ParameterExpression> inScope, bool includeSuffix = true)
         {
             int suffix = 0;
             while (true)
             {
-                string name = prefix + suffix.ToString(CultureInfo.InvariantCulture);
+                string name = prefix + (includeSuffix ? suffix.ToString(CultureInfo.InvariantCulture) : string.Empty);
                 ParameterExpression param = Expression.Parameter(type, name);
-                if (!inScope.Any(p => p.Name.Equals(name)))
+                if (!inScope.Any(p => p.Name.Equals(name)) || !includeSuffix)
                 {
                     inScope.Add(param);
                     return param;
@@ -101,7 +102,7 @@ namespace Microsoft.Azure.Cosmos.Linq
         public T Eval(Expression expr)
         {
             Expression<Func<T>> lambda = Expression.Lambda<Func<T>>(expr);
-            Func<T> func = lambda.Compile();
+            Func<T> func = lambda.Compile(preferInterpretation: true);
             return func();
         }
     }

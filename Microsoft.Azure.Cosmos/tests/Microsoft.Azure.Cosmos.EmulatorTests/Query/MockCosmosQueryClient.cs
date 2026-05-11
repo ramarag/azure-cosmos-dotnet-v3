@@ -6,9 +6,7 @@
     using Microsoft.Azure.Cosmos.Query.Core;
     using Microsoft.Azure.Cosmos.Query.Core.QueryPlan;
     using Microsoft.Azure.Documents;
-    using Microsoft.Azure.Cosmos.Diagnostics;
     using Microsoft.Azure.Cosmos.Query.Core.Monads;
-    using Microsoft.Azure.Cosmos.Query.Core.Pipeline;
     using Microsoft.Azure.Cosmos.Tracing;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline.Pagination;
 
@@ -35,7 +33,7 @@
 
         public int QueryPlanCalls { get; private set; }
 
-        public override bool ByPassQueryParsing()
+        public override bool BypassQueryParsing()
         {
             return this.forceQueryPlanGatewayElseServiceInterop;
         }
@@ -68,12 +66,11 @@
             string resourceUri,
             ResourceType resourceType,
             OperationType operationType,
-            Guid clientQueryCorrelationId,
             FeedRange feedRange,
             QueryRequestOptions requestOptions,
+            AdditionalRequestHeaders additionalRequestHeaders,
             SqlQuerySpec sqlQuerySpec,
             string continuationToken,
-            bool isContinuationExpected,
             int pageSize,
             ITrace trace,
             CancellationToken cancellationToken)
@@ -82,12 +79,11 @@
                 resourceUri: resourceUri,
                 resourceType: resourceType,
                 operationType: operationType,
-                clientQueryCorrelationId: clientQueryCorrelationId,
+                feedRange: feedRange,
                 requestOptions: requestOptions,
+                additionalRequestHeaders: additionalRequestHeaders,
                 sqlQuerySpec: sqlQuerySpec,
                 continuationToken: continuationToken,
-                feedRange: feedRange,
-                isContinuationExpected: isContinuationExpected,
                 pageSize: pageSize,
                 trace: trace,
                 cancellationToken: cancellationToken);

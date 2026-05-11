@@ -12,7 +12,6 @@ namespace Microsoft.Azure.Cosmos.Query
     using Microsoft.Azure.Cosmos.Common;
     using Microsoft.Azure.Cosmos.CosmosElements;
     using Microsoft.Azure.Cosmos.Query.Core.Metrics;
-    using Microsoft.Azure.Cosmos.Query.Core.Pipeline.CrossPartition.Parallel;
     using Microsoft.Azure.Cosmos.Query.Core.QueryPlan;
     using Microsoft.Azure.Cosmos.Routing;
     using Microsoft.Azure.Cosmos.Tracing;
@@ -108,7 +107,7 @@ namespace Microsoft.Azure.Cosmos.Query
                                     partitionIdentifier,
                                     new QueryMetrics(
                                         response.ResponseHeaders[HttpConstants.HttpHeaders.QueryMetrics],
-                                        IndexUtilizationInfo.CreateFromString(response.ResponseHeaders[HttpConstants.HttpHeaders.IndexUtilization], true),
+                                        IndexUtilizationInfo.CreateFromString(response.ResponseHeaders[HttpConstants.HttpHeaders.IndexUtilization]),
                                         new ClientSideMetrics(
                                             this.retries,
                                             response.RequestCharge,
@@ -156,7 +155,7 @@ namespace Microsoft.Azure.Cosmos.Query
                 else
                 {
                     // The query is going to become a full fan out, but we go one partition at a time.
-                    if (ServiceInteropAvailable())
+                    if (!QueryPlanRetriever.BypassQueryParsing())
                     {
                         // Get the routing map provider
                         CollectionCache collectionCache = await this.Client.GetCollectionCacheAsync();
@@ -248,11 +247,6 @@ namespace Microsoft.Azure.Cosmos.Query
             return !string.IsNullOrEmpty(context.PartitionKeyRangeId);
         }
 
-        private static bool ServiceInteropAvailable()
-        {
-            return !CustomTypeExtensions.ByPassQueryParsing();
-        }
-
         private async Task<Tuple<PartitionRoutingHelper.ResolvedRangeInfo, IReadOnlyList<Range<string>>>> TryGetTargetPartitionKeyRangeAsync(
            DocumentServiceRequest request,
            ContainerProperties collection,
@@ -317,6 +311,7 @@ namespace Microsoft.Azure.Cosmos.Query
                         allowNonValueAggregates: false,
                         useSystemPrefix: false,
                         partitionKeyDefinition: partitionKeyDefinition,
+                        vectorEmbeddingPolicy: collection.VectorEmbeddingPolicy,
                         queryPartitionProvider: queryPartitionProvider,
                         clientApiVersion: version,
                         geospatialType: collection.GeospatialConfig.GeospatialType,

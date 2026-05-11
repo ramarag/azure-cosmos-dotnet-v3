@@ -5,12 +5,7 @@
 namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.Skip
 {
     using System;
-    using System.Collections.Generic;
-    using System.Text;
-    using System.Threading;
-    using System.Threading.Tasks;
     using Microsoft.Azure.Cosmos.CosmosElements;
-    using Microsoft.Azure.Cosmos.Query.Core.ExecutionContext;
     using Microsoft.Azure.Cosmos.Query.Core.Monads;
 
     internal abstract partial class SkipQueryPipelineStage : QueryPipelineStageBase
@@ -19,11 +14,10 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.Skip
 
         protected SkipQueryPipelineStage(
             IQueryPipelineStage source,
-            CancellationToken cancellationToken,
             long skipCount)
-            : base(source, cancellationToken)
+            : base(source)
         {
-            if (skipCount > int.MaxValue)
+            if (skipCount > int.MaxValue || skipCount < 0)
             {
                 throw new ArgumentOutOfRangeException(nameof(skipCount));
             }
@@ -32,26 +26,14 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.Skip
         }
 
         public static TryCatch<IQueryPipelineStage> MonadicCreate(
-            ExecutionEnvironment executionEnvironment,
             int offsetCount,
             CosmosElement continuationToken,
-            CancellationToken cancellationToken,
             MonadicCreatePipelineStage monadicCreatePipelineStage)
         {
-            TryCatch<IQueryPipelineStage> tryCreate = executionEnvironment switch
-            {
-                ExecutionEnvironment.Client => ClientSkipQueryPipelineStage.MonadicCreate(
+            TryCatch<IQueryPipelineStage> tryCreate = ClientSkipQueryPipelineStage.MonadicCreate(
                     offsetCount,
                     continuationToken,
-                    cancellationToken,
-                    monadicCreatePipelineStage),
-                ExecutionEnvironment.Compute => ComputeSkipQueryPipelineStage.MonadicCreate(
-                    offsetCount,
-                    continuationToken,
-                    cancellationToken,
-                    monadicCreatePipelineStage),
-                _ => throw new ArgumentException($"Unknown {nameof(ExecutionEnvironment)}: {executionEnvironment}"),
-            };
+                    monadicCreatePipelineStage);
 
             return tryCreate;
         }

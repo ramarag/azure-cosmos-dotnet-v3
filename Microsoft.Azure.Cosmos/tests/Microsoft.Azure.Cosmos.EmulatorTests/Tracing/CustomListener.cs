@@ -13,6 +13,7 @@ namespace Microsoft.Azure.Cosmos.Tests
     using System.Reflection;
     using System.Text;
     using System.Text.RegularExpressions;
+    using Microsoft.Azure.Cosmos.Telemetry;
     using Microsoft.Azure.Cosmos.Tracing;
 
     /// <summary>
@@ -26,35 +27,63 @@ namespace Microsoft.Azure.Cosmos.Tests
     {
         private readonly Func<string, bool> sourceNameFilter;
         private readonly string eventName;
-        
+        private readonly bool suppressAllEvents;
+        private static readonly List<string> TagsWithStaticValue = new List<string>
+        {
+            "az.schema_url",
+            "kind",
+            "az.namespace",
+            "db.operation.name",
+            "db.operation",
+            "db.system",
+            "db.system.name",
+            "server.address",
+            "db.namespace",
+            "db.name",
+            "db.collection.name",
+            "azure.cosmosdb.connection.mode",
+            "azure.cosmosdb.contacted_regions",
+            "azure.cosmosdb.consistency.level",
+            "db.operation.batch.size",
+            "db.query.text",
+            "error.type",
+            AppInsightClassicAttributeKeys.ContainerName,
+            AppInsightClassicAttributeKeys.ServerAddress,
+        };
+
+        private static readonly List<string> TagsToSkip = new List<string>
+        {
+             OpenTelemetryAttributeKeys.ResponseContentLength,
+             OpenTelemetryAttributeKeys.RequestContentLength,
+             AppInsightClassicAttributeKeys.ResponseContentLength,
+             AppInsightClassicAttributeKeys.RequestContentLength
+        };
+
         private ConcurrentBag<IDisposable> subscriptions = new();
         private ConcurrentBag<ProducedDiagnosticScope> Scopes { get; } = new();
         
-        public static ConcurrentBag<Activity> CollectedActivities { private set; get; } = new();
+        public static ConcurrentBag<Activity> CollectedOperationActivities { private set; get; } = new();
+        public static ConcurrentBag<Activity> CollectedNetworkActivities { private set; get; } = new();
         private static ConcurrentBag<string> CollectedEvents { set; get; } = new();
 
-        private string SourceType { set; get; }
+        private static List<EventSource> EventSources { set; get; } = new();
 
-        // Regex is used to match string 'n' against diagnosticNameSpace string
-        // which is constructed by combining first two parts of name.
-        // Eg: Azure.Cosmos.Operation where diagnosticNameSpace is Azure.Cosmos and Operation is the sourceType
-        public CustomListener(string name, string eventName)
-            : this(n =>
-            {
-                string[] nameParts = name.Split(".");
-                string diagnosticNameSpace = $"{nameParts[0]}.{nameParts[1]}";
-                return Regex.Match(n, diagnosticNameSpace).Success;
-            }, name.Split(".")[2], eventName)
-
+        public CustomListener(string name, string eventName, bool suppressAllEvents = false)
+            : this(n => Regex.Match(n, name).Success, eventName, suppressAllEvents)
         {
         }
 
-        public CustomListener(Func<string, bool> filter, string sourceType, string eventName)
+        public CustomListener(Func<string, bool> filter, string eventName, bool suppressAllEvents = false)
         {
             this.sourceNameFilter = filter;
             this.eventName = eventName;
-            this.SourceType = sourceType;
-            
+            this.suppressAllEvents = suppressAllEvents;
+
+            foreach (EventSource eventSource in EventSources)
+            {
+                this.OnEventSourceCreated(eventSource);
+            }
+
             DiagnosticListener.AllListeners.Subscribe(this);
         }
 
@@ -87,12 +116,7 @@ namespace Microsoft.Azure.Cosmos.Tests
                 string startSuffix = ".Start";
                 string stopSuffix = ".Stop";
                 string exceptionSuffix = ".Exception";
-                
-                if(!this.SourceType.Contains("*") && !Activity.Current.OperationName.Contains(this.SourceType)) 
-                {
-                    return;
-                }
-                
+
                 if (value.Key.EndsWith(startSuffix))
                 {
                     string name = value.Key[..^startSuffix.Length];
@@ -115,9 +139,16 @@ namespace Microsoft.Azure.Cosmos.Tests
                     {
                         if (producedDiagnosticScope.Activity.Id == Activity.Current.Id)
                         {
-                            AssertActivity.IsValid(producedDiagnosticScope.Activity);
-                            CustomListener.CollectedActivities.Add(producedDiagnosticScope.Activity);
-
+                            if (producedDiagnosticScope.Activity.OperationName.StartsWith("Operation."))
+                            {
+                                AssertActivity.IsValidOperationActivity(producedDiagnosticScope.Activity);
+                                CustomListener.CollectedOperationActivities.Add(producedDiagnosticScope.Activity);
+                            }
+                            else if (producedDiagnosticScope.Activity.OperationName.StartsWith("Request."))
+                            {
+                                CustomListener.CollectedNetworkActivities.Add(producedDiagnosticScope.Activity);
+                            }
+                            
                             producedDiagnosticScope.IsCompleted = true;
                             return;
                         }
@@ -151,7 +182,15 @@ namespace Microsoft.Azure.Cosmos.Tests
             {
                 lock (this.Scopes)
                 {
-                    this.subscriptions?.Add(value.Subscribe(this));
+                    IDisposable subscriber = value.Subscribe(this, isEnabled: (name) =>
+                    {
+                        if (this.suppressAllEvents)
+                        {
+                            return false;
+                        }
+                        return true;
+                    });
+                    this.subscriptions?.Add(subscriber);
                 }
             }
         }
@@ -161,6 +200,16 @@ namespace Microsoft.Azure.Cosmos.Tests
         /// </summary>
         protected override void OnEventSourceCreated(EventSource eventSource)
         {
+            if (this.eventName == null)
+            {
+                EventSources.Add(eventSource);
+            }
+
+            if (this.eventName == null)
+            {
+                EventSources.Add(eventSource);
+            }
+
             if (eventSource != null && eventSource.Name.Equals(this.eventName))
             {
                 this.EnableEvents(eventSource, EventLevel.Informational); // Enable information level events
@@ -173,13 +222,8 @@ namespace Microsoft.Azure.Cosmos.Tests
         protected override void OnEventWritten(EventWrittenEventArgs eventData)
         {
             StringBuilder builder = new StringBuilder();
-            builder.Append("<EVENT>")
-                   .Append("<EVENT-NAME>").Append(eventData.EventName).Append("</EVENT-NAME>")
-                   .Append("<EVENT-TEXT>Ideally, this should contain request diagnostics but request diagnostics is " +
-                   "subject to change with each request as it contains few unique id. " +
-                   "So just putting this tag with this static text to make sure event is getting generated" +
-                   " for each test.</EVENT-TEXT>")
-                   .Append("</EVENT>");
+            builder.Append($"<EVENT name='{eventData.EventName}'/>");
+            
             CustomListener.CollectedEvents.Add(builder.ToString());
         }
         
@@ -236,37 +280,25 @@ namespace Microsoft.Azure.Cosmos.Tests
         
         private string GenerateTagForBaselineTest(Activity activity)
         {
-            List<string> tagsWithStaticValue = new List<string>
-            {
-                "kind",
-                "az.namespace",
-                "db.operation",
-                "db.system",
-                "net.peer.name",
-                "db.cosmosdb.connection_mode",
-                "db.cosmosdb.operation_type",
-                "db.cosmosdb.regions_contacted"
-            };
-            
             StringBuilder builder = new StringBuilder();
-            builder.Append("<ACTIVITY>")
-                   .Append("<OPERATION>")
-                   .Append(activity.OperationName)
-                   .Append("</OPERATION>");
-            
-            foreach (KeyValuePair<string, string> tag in activity.Tags)
-            {
-                builder
-                .Append("<ATTRIBUTE-KEY>")
-                .Append(tag.Key)
-                .Append("</ATTRIBUTE-KEY>");
+            builder.Append($"<ACTIVITY source='{activity.Source.Name}' operationName='{activity.OperationName}' displayName='{activity.DisplayName}'>");
 
-                if (tagsWithStaticValue.Contains(tag.Key))
+            foreach (KeyValuePair<string, object> tag in activity.TagObjects)
+            {
+                if (TagsToSkip.Contains(tag.Key))
+                {
+                    continue;
+                }
+
+                if (TagsWithStaticValue.Contains(tag.Key))
                 {
                     builder
-                    .Append("<ATTRIBUTE-VALUE>")
-                    .Append(tag.Value)
-                    .Append("</ATTRIBUTE-VALUE>");
+                    .Append($"<ATTRIBUTE key='{tag.Key}'>{tag.Value}</ATTRIBUTE>");
+                }
+                else
+                {
+                    builder
+                    .Append($"<ATTRIBUTE key='{tag.Key}'>Some Value</ATTRIBUTE>");
                 }
             }
             
@@ -278,15 +310,46 @@ namespace Microsoft.Azure.Cosmos.Tests
         public List<string> GetRecordedAttributes() 
         {
             List<string> generatedActivityTagsForBaselineXmls = new();
-            List<Activity> collectedActivities = new List<Activity>(CustomListener.CollectedActivities);
-
-            collectedActivities.OrderBy(act => act.OperationName);
             
-            foreach (Activity activity in collectedActivities)
+            // Get all the recorded operation level activities
+            List<Activity> collectedOperationActivities = new List<Activity>(CustomListener.CollectedOperationActivities);
+
+            // Order them by the static values. This is to make sure that the order of the attributes is always same.
+            List<Activity> orderedUniqueOperationActivities = collectedOperationActivities
+               .OrderBy(act =>
+               {
+                   string key = act.Source.Name + act.OperationName;
+                   foreach (string tagName in TagsWithStaticValue)
+                   {
+                       key += act.GetTagItem(tagName);
+                   }
+                   return key;
+               }).ToList();
+
+            // Generate XML tags for Baseline xmls
+            foreach (Activity activity in collectedOperationActivities)
             {
                 generatedActivityTagsForBaselineXmls.Add(this.GenerateTagForBaselineTest(activity));
             }
+
+            // Get all the recorded network level activities
+            HashSet<Activity> collectedNetworkActivities = new HashSet<Activity>(CustomListener.CollectedNetworkActivities, new NetworkActivityComparer());
             
+            // Order them by the static values. This is to make sure that the order of the attributes is always same.
+            List<Activity> orderedUniqueNetworkActivities = collectedNetworkActivities
+                .OrderBy(act => 
+                            act.Source.Name + 
+                            act.OperationName + 
+                            act.GetTagItem("rntbd.status_code") + 
+                            act.GetTagItem("rntbd.sub_status_code"))
+                .ToList();
+
+            // Generate XML tags for Baseline xmls
+            foreach (Activity activity in orderedUniqueNetworkActivities)
+            {
+                generatedActivityTagsForBaselineXmls.Add(this.GenerateTagForBaselineTest(activity));
+            }
+
             List<string> outputList = new List<string>();
             if(generatedActivityTagsForBaselineXmls != null && generatedActivityTagsForBaselineXmls.Count > 0)
             {
@@ -304,7 +367,8 @@ namespace Microsoft.Azure.Cosmos.Tests
         public void ResetAttributes()
         {
             CustomListener.CollectedEvents = new();
-            CustomListener.CollectedActivities = new();
+            CustomListener.CollectedOperationActivities = new();
+            CustomListener.CollectedNetworkActivities = new();
         }
 
         public class ProducedDiagnosticScope
@@ -340,5 +404,22 @@ namespace Microsoft.Azure.Cosmos.Tests
             public string Traceparent { get; set; }
             public string Tracestate { get; set; }
         }
+
+        public class NetworkActivityComparer : IEqualityComparer<Activity>
+        {
+            public bool Equals(Activity x, Activity y)
+            {
+                string xData = x.Source.Name + x.OperationName + x.GetTagItem("rntbd.status_code") + x.GetTagItem("rntbd.sub_status_code");
+                string yData = y.Source.Name + y.OperationName + y.GetTagItem("rntbd.status_code") + y.GetTagItem("rntbd.sub_status_code");
+
+                return xData.Equals(yData, StringComparison.OrdinalIgnoreCase);
+            }
+
+            public int GetHashCode(Activity obj)
+            {
+                return (obj.Source.Name + obj.OperationName + obj.GetTagItem("rntbd.status_code") + obj.GetTagItem("rntbd.sub_status_code")).GetHashCode() ;
+            }
+        }
+
     }
 }

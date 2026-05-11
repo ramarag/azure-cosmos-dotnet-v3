@@ -14,7 +14,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
     using System.Runtime.Serialization;
     using System.Text;
     using System.Threading.Tasks;
-    using Microsoft.Azure.Cosmos.Linq;
+    using Microsoft.Azure.Cosmos.Tracing;
     using Microsoft.Azure.Cosmos.Utils;
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Client;
@@ -35,7 +35,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
         private Uri databaseUri;
         private Uri collectionUri;
         private Uri partitionedCollectionUri;
-        private PartitionKeyDefinition defaultPartitionKeyDefinition = new PartitionKeyDefinition { Paths = new System.Collections.ObjectModel.Collection<string>(new[] { "/pk" }), Kind = PartitionKind.Hash };
+        private readonly PartitionKeyDefinition defaultPartitionKeyDefinition = new PartitionKeyDefinition { Paths = new System.Collections.ObjectModel.Collection<string>(new[] { "/pk" }), Kind = PartitionKind.Hash };
 
         internal abstract DocumentClient CreateDocumentClient(
             Uri hostUri,
@@ -77,7 +77,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
             {
                 if (ex.StatusCode == System.Net.HttpStatusCode.ServiceUnavailable)
                 {
-                    // Emulator con sometimes fail under load, so we retry
+                    // Emulator can sometimes fail under load, so we retry
                     Task.Delay(1000);
                     this.documentClient.CreateDocumentCollectionAsync(this.databaseUri, newCollection, new RequestOptions { OfferThroughput = 400 }).Wait();
                 }
@@ -100,7 +100,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
             {
                 if (ex.StatusCode == System.Net.HttpStatusCode.ServiceUnavailable)
                 {
-                    // Emulator con sometimes fail under load, so we retry
+                    // Emulator can sometimes fail under load, so we retry
                     Task.Delay(1000);
                     this.documentClient.CreateDocumentCollectionAsync(this.databaseUri, partitionedCollection, new RequestOptions { OfferThroughput = 10000 }).Wait();
                 }
@@ -136,13 +136,12 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
             // Verify round-trip create and read document
             RequestOptions applyRequestOptions = this.ApplyRequestOptions(new RequestOptions(), serializerSettings);
 
-            this.AssertPropertyOnReadDocument(client, this.collectionUri, createdDocument, applyRequestOptions, originalDocument, jsonProperty);
-            this.AssertPropertyOnReadDocument(client, this.partitionedCollectionUri, partitionedDocument, applyRequestOptions, originalDocument, jsonProperty);
+            this.AssertPropertyOnReadDocument(client, createdDocument, applyRequestOptions, originalDocument, jsonProperty);
+            this.AssertPropertyOnReadDocument(client, partitionedDocument, applyRequestOptions, originalDocument, jsonProperty);
         }
 
         private void AssertPropertyOnReadDocument(
             DocumentClient client,
-            Uri targetCollectionUri,
             Document createdDocument,
             RequestOptions requestOptions,
             Document originalDocument,
@@ -246,6 +245,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 }";
 
             DocumentClient client = new DocumentClient(this.hostUri, this.masterKey, serializerSettings);
+            await client.EnsureValidClientAsync(NoOpTrace.Singleton);
 
             StoredProcedure sproc = await client.CreateStoredProcedureAsync(this.collectionUri, storedProcedureDef);
 
@@ -311,26 +311,6 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
             }
 
             this.AssertEqual(testDocument, allDocuments.First());
-
-            //Will add LINQ test once it is available with new V3 OM 
-            // // LINQ Lambda
-            // var query1 = client.CreateDocumentQuery<TestDocument>(partitionedCollectionUri, options)
-            //            .Where(_ => _.Id.CompareTo(String.Empty) > 0)
-            //            .Select(_ => _.Id);
-            // string query1Str = query1.ToString();
-            // var result = query1.ToList();
-            // Assert.AreEqual(1, result.Count);
-            // Assert.AreEqual(testDocument.Id, result[0]);
-
-            // // LINQ Query
-            // var query2 =
-            //     from f in client.CreateDocumentQuery<TestDocument>(partitionedCollectionUri, options)
-            //     where f.Id.CompareTo(String.Empty) > 0
-            //     select f.Id;
-            // string query2Str = query2.ToString();
-            // var result2 = query2.ToList();
-            // Assert.AreEqual(1, result2.Count);
-            // Assert.AreEqual(testDocument.Id, result2[0]);
         }
 
         [TestMethod]
@@ -347,6 +327,8 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 serializerSettings,
                 connectionPolicy,
                 defaultConsistencyLevel);
+
+            client.EnsureValidClientAsync(NoOpTrace.Singleton).Wait();
 
             // Create a simple stored procedure
             string scriptId = "bulkImportScript";
@@ -555,6 +537,9 @@ function bulkImport(docs) {
                 serializerSettings,
                 connectionPolicy,
                 defaultConsistencyLevel);
+
+            client.EnsureValidClientAsync(NoOpTrace.Singleton).Wait();
+
             originalDocument = new Document();
             originalDocument.SetPropertyValue(jsonPropertyName, "2017-05-18T17:17:32.7514920Z");
             originalDocument.SetPropertyValue(PartitionKeyProperty, "value");

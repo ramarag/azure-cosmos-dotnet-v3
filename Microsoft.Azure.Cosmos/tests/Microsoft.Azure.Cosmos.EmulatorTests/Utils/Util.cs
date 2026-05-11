@@ -131,6 +131,59 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
             requestChargeHelper?.CompareRequestCharge(testName);
         }
 
+        internal static async Task DeleteAllDatabasesAsync(CosmosClient client,
+            IEnumerable<string> excludeDbIds = null,
+            bool deleteContainersOnExcludedDbs = true,
+            ItemRequestOptions requestOptions = null)
+        {
+            if (client == null)
+            {
+                return;
+            }
+
+            QueryRequestOptions queryRequestIptions = new QueryRequestOptions()
+            {
+                OperationMetricsOptions = requestOptions?.OperationMetricsOptions,
+                NetworkMetricsOptions = requestOptions?.NetworkMetricsOptions
+            };
+
+            using (FeedIterator<DatabaseProperties> feedIterator = client.GetDatabaseQueryIterator<DatabaseProperties>(requestOptions: queryRequestIptions))
+            {
+                while (feedIterator.HasMoreResults)
+                {
+                    FeedResponse<DatabaseProperties> response = await feedIterator.ReadNextAsync();
+                    foreach (DatabaseProperties database in response)
+                    {
+                        Cosmos.Database db = client.GetDatabase(database.Id);
+                        if (excludeDbIds?.Contains(database.Id) != true)
+                        {
+                            await db.DeleteAsync(requestOptions: requestOptions);
+                        }
+                        else if(deleteContainersOnExcludedDbs)
+                        {
+                            await DeleteAllContainersAsync(db, queryRequestIptions);
+                        }
+                    }
+                }
+            }
+        }
+
+        private static async Task DeleteAllContainersAsync(Cosmos.Database db, QueryRequestOptions queryRequestIptions = null)
+        {
+            using (FeedIterator<ContainerProperties> containerfeedIterator = db.GetContainerQueryIterator<ContainerProperties>(requestOptions: queryRequestIptions))
+            {
+                while (containerfeedIterator.HasMoreResults)
+                {
+                    FeedResponse<ContainerProperties> containerResponse = await containerfeedIterator.ReadNextAsync();
+                    foreach (ContainerProperties container in containerResponse)
+                    {
+                        System.Diagnostics.Trace.TraceInformation($"Deleting container {container.Id}");
+                        await db.GetContainer(container.Id).DeleteContainerAsync();
+                    }
+                }
+            }
+        }
+
         /// <summary>
         /// Helper function to run a test scenario for a random client of type DocumentClientType.
         /// </summary>
@@ -522,20 +575,6 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 options.OfferThroughput);
         }
 
-        internal static void EnableClientTelemetryEnvironmentVariables()
-        {
-            Environment.SetEnvironmentVariable(ClientTelemetryOptions.EnvPropsClientTelemetryEnabled, "true");
-            Environment.SetEnvironmentVariable(ClientTelemetryOptions.EnvPropsClientTelemetrySchedulingInSeconds, "1");
-            Environment.SetEnvironmentVariable(ClientTelemetryOptions.EnvPropsClientTelemetryEndpoint, "http://dummy.telemetry.endpoint/");
-        }
-
-        internal static void DisableClientTelemetryEnvironmentVariables()
-        {
-            Environment.SetEnvironmentVariable(ClientTelemetryOptions.EnvPropsClientTelemetryEnabled, null);
-            Environment.SetEnvironmentVariable(ClientTelemetryOptions.EnvPropsClientTelemetrySchedulingInSeconds, null);
-            Environment.SetEnvironmentVariable(ClientTelemetryOptions.EnvPropsClientTelemetryEndpoint, null);
-        }
-
         private static TracerProvider OTelTracerProvider;
         private static CustomListener TestListener;
         
@@ -548,11 +587,11 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
             // Open Telemetry Listener
             Util.OTelTracerProvider = Sdk.CreateTracerProviderBuilder()
                 .AddCustomOtelExporter() // use any exporter here
-                .AddSource($"{OpenTelemetryAttributeKeys.DiagnosticNamespace}.Operation") // Right now, it will capture only "Azure.Cosmos.Operation"
+                .AddSource($"{OpenTelemetryAttributeKeys.DiagnosticNamespace}.*")
                 .Build();
 
             // Custom Listener
-            Util.TestListener = new CustomListener($"{OpenTelemetryAttributeKeys.DiagnosticNamespace}.Operation", "Azure-Cosmos-Operation-Request-Diagnostics");
+            Util.TestListener = new CustomListener($"{OpenTelemetryAttributeKeys.DiagnosticNamespace}.*", "Azure-Cosmos-Operation-Request-Diagnostics");
 
             return Util.TestListener;
 

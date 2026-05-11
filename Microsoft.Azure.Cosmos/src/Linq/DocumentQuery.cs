@@ -15,7 +15,6 @@ namespace Microsoft.Azure.Cosmos.Linq
     using Microsoft.Azure.Cosmos.Core.Trace;
     using Microsoft.Azure.Cosmos.CosmosElements;
     using Microsoft.Azure.Cosmos.Query;
-    using Microsoft.Azure.Cosmos.Query.Core;
     using Microsoft.Azure.Cosmos.Query.Core.Metrics;
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Collections;
@@ -273,10 +272,10 @@ namespace Microsoft.Azure.Cosmos.Linq
 
         public override string ToString()
         {
-            SqlQuerySpec querySpec = DocumentQueryEvaluator.Evaluate(this.Expression);
-            if (querySpec != null)
+            LinqQueryOperation linqQueryOperation = DocumentQueryEvaluator.Evaluate(this.Expression);
+            if (linqQueryOperation.SqlQuerySpec != null)
             {
-                return JsonConvert.SerializeObject(querySpec);
+                return JsonConvert.SerializeObject(linqQueryOperation.SqlQuerySpec);
             }
 
             return new Uri(this.client.ServiceEndpoint, this.documentsFeedOrDatabaseLink).ToString();

@@ -9,6 +9,7 @@ namespace Microsoft.Azure.Cosmos.Routing
     using System.Threading.Tasks;
     using Microsoft.Azure.Cosmos.Common;
     using Microsoft.Azure.Cosmos.Telemetry;
+    using Microsoft.Azure.Cosmos.Telemetry.Collector;
     using Microsoft.Azure.Cosmos.Tracing;
     using Microsoft.Azure.Cosmos.Tracing.TraceData;
     using Microsoft.Azure.Documents;
@@ -25,20 +26,22 @@ namespace Microsoft.Azure.Cosmos.Routing
         private readonly ICosmosAuthorizationTokenProvider tokenProvider;
         private readonly IRetryPolicyFactory retryPolicy;
         private readonly ISessionContainer sessionContainer;
-        private readonly ClientTelemetry clientTelemetry;
+        private readonly TelemetryToServiceHelper telemetryToServiceHelper;
 
         public ClientCollectionCache(
             ISessionContainer sessionContainer,
             IStoreModel storeModel,
             ICosmosAuthorizationTokenProvider tokenProvider,
             IRetryPolicyFactory retryPolicy,
-            ClientTelemetry clientTelemetry)
+            TelemetryToServiceHelper telemetryToServiceHelper,
+            bool enableAsyncCacheExceptionNoSharing = true)
+            : base(enableAsyncCacheExceptionNoSharing)
         {
             this.storeModel = storeModel ?? throw new ArgumentNullException("storeModel");
             this.tokenProvider = tokenProvider;
             this.retryPolicy = retryPolicy;
             this.sessionContainer = sessionContainer;
-            this.clientTelemetry = clientTelemetry;
+            this.telemetryToServiceHelper = telemetryToServiceHelper;
         }
 
         protected override Task<ContainerProperties> GetByRidAsync(string apiVersion,
@@ -153,16 +156,35 @@ namespace Microsoft.Azure.Cosmos.Routing
         {
             string previouslyResolvedCollectionRid = request?.RequestContext?.ResolvedCollectionRid;
 
-            ContainerProperties properties = await resolveContainerProvider();
-
-            if (this.sessionContainer != null &&
-                previouslyResolvedCollectionRid != null &&
-                previouslyResolvedCollectionRid != properties.ResourceId)
+            try
             {
-                this.sessionContainer.ClearTokenByResourceId(previouslyResolvedCollectionRid);
-            }
+                ContainerProperties properties = await resolveContainerProvider();
 
-            return properties;
+                if (this.sessionContainer != null &&
+                    previouslyResolvedCollectionRid != null &&
+                    previouslyResolvedCollectionRid != properties.ResourceId)
+                {
+                    this.sessionContainer.ClearTokenByResourceId(previouslyResolvedCollectionRid);
+                }
+
+                return properties;
+            }
+            catch (DocumentClientException ex)
+            {
+                // When collection resolution fails with 404, set the appropriate substatus code.
+                // - For document/item operations: Set substatus 1003 (OwnerResourceNotFound) to distinguish
+                //   "container doesn't exist" from "item doesn't exist" (substatus 0).
+                // - For container operations: Leave substatus as 0 because the container itself is the
+                //   resource that doesn't exist (not an "owner" resource issue).
+                if (ex.StatusCode == System.Net.HttpStatusCode.NotFound && 
+                    ex.GetSubStatus() == SubStatusCodes.Unknown &&
+                    request?.ResourceType != ResourceType.Collection)
+                {
+                    ex.Headers[WFConstants.BackendHeaders.SubStatus] = ((uint)SubStatusCodes.OwnerResourceNotFound).ToString(System.Globalization.CultureInfo.InvariantCulture);
+                }
+
+                throw;
+            }
         }
 
         private async Task<ContainerProperties> ReadCollectionAsync(
@@ -186,7 +208,7 @@ namespace Microsoft.Azure.Cosmos.Routing
                 {
                     headers.XDate = Rfc1123DateTimeCache.UtcNow();
 
-                    request.RequestContext.ClientRequestStatistics = clientSideRequestStatistics ?? new ClientSideRequestStatisticsTraceDatum(DateTime.UtcNow, trace.Summary);
+                    request.RequestContext.ClientRequestStatistics = clientSideRequestStatistics ?? new ClientSideRequestStatisticsTraceDatum(DateTime.UtcNow, trace);
                     if (clientSideRequestStatistics == null)
                     {
                         childTrace.AddDatum(
@@ -214,21 +236,19 @@ namespace Microsoft.Azure.Cosmos.Routing
                                 await this.storeModel.ProcessMessageAsync(request))
                             {
                                 ContainerProperties containerProperties = CosmosResource.FromStream<ContainerProperties>(response);
-
-                                if (this.clientTelemetry != null)
-                                {
-                                    ClientCollectionCache.GetDatabaseAndCollectionName(collectionLink, out string databaseName, out string collectionName);
-                                    this.clientTelemetry.CollectCacheInfo(
-                                                    cacheRefreshSource: ClientCollectionCache.TelemetrySourceName,
-                                                    regionsContactedList: response.RequestStats.RegionsContacted,
-                                                    requestLatency: response.RequestStats.RequestLatency,
-                                                    statusCode: response.StatusCode,
-                                                    containerId: collectionName,
-                                                    operationType: request.OperationType,
-                                                    resourceType: request.ResourceType,
-                                                    subStatusCode: response.SubStatusCode,
-                                                    databaseId: databaseName);
-                                }
+                                
+                                this.telemetryToServiceHelper.GetCollector().CollectCacheInfo(
+                                     ClientCollectionCache.TelemetrySourceName,
+                                     () => new TelemetryInformation
+                                     {
+                                         RegionsContactedList = response.RequestStats.RegionsContacted,
+                                         RequestLatency = response.RequestStats.RequestLatency,
+                                         StatusCode = response.StatusCode,
+                                         OperationType = request.OperationType,
+                                         ResourceType = request.ResourceType,
+                                         SubStatusCode = response.SubStatusCode,
+                                         CollectionLink = collectionLink
+                                     });
 
                                 return containerProperties;
                             }
@@ -241,13 +261,6 @@ namespace Microsoft.Azure.Cosmos.Routing
                     }
                 }
             }
-        }
-
-        private static void GetDatabaseAndCollectionName(string path, out string databaseName, out string collectionName)
-        {
-            string[] segments = path.Split(new char[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
-
-            PathsHelper.ParseDatabaseNameAndCollectionNameFromUrlSegments(segments, out databaseName, out collectionName);
         }
     }
 }

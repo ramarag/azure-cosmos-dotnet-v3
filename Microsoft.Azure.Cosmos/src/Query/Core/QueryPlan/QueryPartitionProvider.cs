@@ -6,11 +6,11 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
 {
     using System;
     using System.Collections.Generic;
-    using System.Linq;
     using System.Runtime.InteropServices;
     using System.Text;
     using Microsoft.Azure.Cosmos.Core.Trace;
     using Microsoft.Azure.Cosmos.Query.Core.Exceptions;
+    using Microsoft.Azure.Cosmos.Query.Core.ExecutionContext;
     using Microsoft.Azure.Cosmos.Query.Core.Monads;
     using Microsoft.Azure.Cosmos.Routing;
     using Microsoft.Azure.Cosmos.Tracing;
@@ -45,6 +45,9 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
         private bool disposed;
         private string queryengineConfiguration;
 
+        // TODO: Move this into a config class of its own
+        public bool ClientDisableOptimisticDirectExecution { get; private set; }
+
         public QueryPartitionProvider(IDictionary<string, object> queryengineConfiguration)
         {
             if (queryengineConfiguration == null)
@@ -59,6 +62,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
 
             this.disposed = false;
             this.queryengineConfiguration = JsonConvert.SerializeObject(queryengineConfiguration);
+            this.ClientDisableOptimisticDirectExecution = GetClientDisableOptimisticDirectExecution((IReadOnlyDictionary<string, object>)queryengineConfiguration);
             this.serviceProvider = IntPtr.Zero;
 
             this.serviceProviderStateLock = new object();
@@ -91,6 +95,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
                     if (!string.Equals(this.queryengineConfiguration, newConfiguration))
                     {
                         this.queryengineConfiguration = newConfiguration;
+                        this.ClientDisableOptimisticDirectExecution = GetClientDisableOptimisticDirectExecution((IReadOnlyDictionary<string, object>)queryengineConfiguration);
 
                         if (!this.disposed && this.serviceProvider != IntPtr.Zero)
                         {
@@ -113,24 +118,29 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
         public TryCatch<PartitionedQueryExecutionInfo> TryGetPartitionedQueryExecutionInfo(
             string querySpecJsonString,
             PartitionKeyDefinition partitionKeyDefinition,
+            VectorEmbeddingPolicy vectorEmbeddingPolicy,
             bool requireFormattableOrderByQuery,
             bool isContinuationExpected,
             bool allowNonValueAggregateQuery,
             bool hasLogicalPartitionKey,
             bool allowDCount,
             bool useSystemPrefix,
+            bool hybridSearchSkipOrderByRewrite,
             GeospatialType geospatialType)
         {
             TryCatch<PartitionedQueryExecutionInfoInternal> tryGetInternalQueryInfo = this.TryGetPartitionedQueryExecutionInfoInternal(
                 querySpecJsonString: querySpecJsonString,
                 partitionKeyDefinition: partitionKeyDefinition,
+                vectorEmbeddingPolicy: vectorEmbeddingPolicy,
                 requireFormattableOrderByQuery: requireFormattableOrderByQuery,
                 isContinuationExpected: isContinuationExpected,
                 allowNonValueAggregateQuery: allowNonValueAggregateQuery,
                 hasLogicalPartitionKey: hasLogicalPartitionKey,
                 allowDCount: allowDCount,
                 useSystemPrefix: useSystemPrefix,
+                hybridSearchSkipOrderByRewrite: hybridSearchSkipOrderByRewrite,
                 geospatialType: geospatialType);
+
             if (!tryGetInternalQueryInfo.Succeeded)
             {
                 return TryCatch<PartitionedQueryExecutionInfo>.FromException(tryGetInternalQueryInfo.Exception);
@@ -140,6 +150,16 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
             return TryCatch<PartitionedQueryExecutionInfo>.FromResult(queryInfo);
         }
 
+        private static bool GetClientDisableOptimisticDirectExecution(IReadOnlyDictionary<string, object> queryengineConfiguration)
+        {
+            if (queryengineConfiguration.TryGetValue(CosmosQueryExecutionContextFactory.ClientDisableOptimisticDirectExecution, out object queryConfigProperty))
+            {
+                return (bool)queryConfigProperty;
+            }
+
+            return false;
+        }
+
         internal PartitionedQueryExecutionInfo ConvertPartitionedQueryExecutionInfo(
             PartitionedQueryExecutionInfoInternal queryInfoInternal,
             PartitionKeyDefinition partitionKeyDefinition)
@@ -147,11 +167,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
             List<Documents.Routing.Range<string>> effectiveRanges = new List<Documents.Routing.Range<string>>(queryInfoInternal.QueryRanges.Count);
             foreach (Documents.Routing.Range<PartitionKeyInternal> internalRange in queryInfoInternal.QueryRanges)
             {
-                effectiveRanges.Add(new Documents.Routing.Range<string>(
-                     internalRange.Min.GetEffectivePartitionKeyString(partitionKeyDefinition, false),
-                     internalRange.Max.GetEffectivePartitionKeyString(partitionKeyDefinition, false),
-                     internalRange.IsMinInclusive,
-                     internalRange.IsMaxInclusive));
+                effectiveRanges.Add(PartitionKeyInternal.GetEffectivePartitionKeyRange(partitionKeyDefinition, internalRange));
             }
 
             effectiveRanges.Sort(Documents.Routing.Range<string>.MinComparer.Instance);
@@ -160,18 +176,21 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
             {
                 QueryInfo = queryInfoInternal.QueryInfo,
                 QueryRanges = effectiveRanges,
+                HybridSearchQueryInfo = queryInfoInternal.HybridSearchQueryInfo,
             };
         }
 
         internal TryCatch<PartitionedQueryExecutionInfoInternal> TryGetPartitionedQueryExecutionInfoInternal(
             string querySpecJsonString,
             PartitionKeyDefinition partitionKeyDefinition,
+            VectorEmbeddingPolicy vectorEmbeddingPolicy,
             bool requireFormattableOrderByQuery,
             bool isContinuationExpected,
             bool allowNonValueAggregateQuery,
             bool hasLogicalPartitionKey,
             bool allowDCount,
             bool useSystemPrefix,
+            bool hybridSearchSkipOrderByRewrite,
             GeospatialType geospatialType)
         {
             if (querySpecJsonString == null || partitionKeyDefinition == null)
@@ -210,6 +229,10 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
             uint errorCode;
             uint serializedQueryExecutionInfoResultLength;
 
+            string vectorEmbeddingPolicyString = vectorEmbeddingPolicy != null ?
+                JsonConvert.SerializeObject(vectorEmbeddingPolicy) :
+                null;
+
             unsafe
             {
                 ServiceInteropWrapper.PartitionKeyRangesApiOptions partitionKeyRangesApiOptions =
@@ -221,19 +244,22 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
                         bIsContinuationExpected = Convert.ToInt32(isContinuationExpected),
                         bRequireFormattableOrderByQuery = Convert.ToInt32(requireFormattableOrderByQuery),
                         bUseSystemPrefix = Convert.ToInt32(useSystemPrefix),
+                        bHybridSearchSkipOrderByRewrite = Convert.ToInt32(hybridSearchSkipOrderByRewrite),
                         eGeospatialType = Convert.ToInt32(geospatialType),
                         ePartitionKind = Convert.ToInt32(partitionKind)
                     };
 
                 fixed (byte* bytePtr = buffer)
                 {
-                    errorCode = ServiceInteropWrapper.GetPartitionKeyRangesFromQuery3(
+                    errorCode = ServiceInteropWrapper.GetPartitionKeyRangesFromQuery4(
                         this.serviceProvider,
                         querySpecJsonString,
                         partitionKeyRangesApiOptions,
                         allParts,
                         partsLengths,
                         (uint)partitionKeyDefinition.Paths.Count,
+                        vectorEmbeddingPolicyString,
+                        vectorEmbeddingPolicyString?.Length ?? 0,
                         new IntPtr(bytePtr),
                         (uint)buffer.Length,
                         out serializedQueryExecutionInfoResultLength);
@@ -247,13 +273,15 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
 
                         fixed (byte* bytePtr2 = buffer)
                         {
-                            errorCode = ServiceInteropWrapper.GetPartitionKeyRangesFromQuery3(
+                            errorCode = ServiceInteropWrapper.GetPartitionKeyRangesFromQuery4(
                                 this.serviceProvider,
                                 querySpecJsonString,
                                 partitionKeyRangesApiOptions,
                                 allParts,
                                 partsLengths,
                                 (uint)partitionKeyDefinition.Paths.Count,
+                                vectorEmbeddingPolicyString,
+                                vectorEmbeddingPolicyString?.Length ?? 0,
                                 new IntPtr(bytePtr2),
                                 (uint)buffer.Length,
                                 out serializedQueryExecutionInfoResultLength);
@@ -294,7 +322,54 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
                        MaxDepth = 64, // https://github.com/advisories/GHSA-5crp-9r3c-p9vr
                    });
 
+            if (!this.ValidateQueryExecutionInfo(queryInfoInternal, out ArgumentException innerException))
+            {
+                return TryCatch<PartitionedQueryExecutionInfoInternal>.FromException(
+                    new ExpectedQueryPartitionProviderException(
+                        serializedQueryExecutionInfo,
+                        innerException));
+            }
+
             return TryCatch<PartitionedQueryExecutionInfoInternal>.FromResult(queryInfoInternal);
+        }
+
+        private bool ValidateQueryExecutionInfo(PartitionedQueryExecutionInfoInternal queryExecutionInfo, out ArgumentException innerException)
+        {
+            if (queryExecutionInfo.QueryInfo?.Limit.HasValue == true &&
+                queryExecutionInfo.QueryInfo.Limit.Value > int.MaxValue)
+            {
+                innerException = new ArgumentOutOfRangeException("QueryInfo.Limit");
+                return false;
+            }
+
+            if (queryExecutionInfo.QueryInfo?.Offset.HasValue == true &&
+                queryExecutionInfo.QueryInfo.Offset.Value > int.MaxValue)
+            {
+                innerException = new ArgumentOutOfRangeException("QueryInfo.Offset");
+                return false;
+            }
+
+            if (queryExecutionInfo.QueryInfo?.Top.HasValue == true &&
+                queryExecutionInfo.QueryInfo.Top.Value > int.MaxValue)
+            {
+                innerException = new ArgumentOutOfRangeException("QueryInfo.Top");
+                return false;
+            }
+
+            if ((queryExecutionInfo.HybridSearchQueryInfo?.Skip ?? 0) > int.MaxValue)
+            {
+                innerException = new ArgumentOutOfRangeException("HybridSearchQueryInfo.Skip");
+                return false;
+            }
+
+            if ((queryExecutionInfo.HybridSearchQueryInfo?.Take ?? 0) > int.MaxValue)
+            {
+                innerException = new ArgumentOutOfRangeException("HybridSearchQueryInfo.Take");
+                return false;
+            }
+
+            innerException = null;
+            return true;
         }
 
         internal static TryCatch<IntPtr> TryCreateServiceProvider(string queryEngineConfiguration)
@@ -308,7 +383,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
                 Exception exception = Marshal.GetExceptionForHR((int)errorCode);
                 if (exception != null)
                 {
-                    DefaultTrace.TraceWarning("QueryPartitionProvider.TryCreateServiceProvider failed with exception {0}", exception);
+                    DefaultTrace.TraceWarning("QueryPartitionProvider.TryCreateServiceProvider failed with exception {0}", exception?.Message);
                     return TryCatch<IntPtr>.FromException(exception);
                 }
                 
@@ -316,7 +391,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core.QueryPlan
             }
             catch (Exception ex)
             {
-                DefaultTrace.TraceWarning("QueryPartitionProvider.TryCreateServiceProvider failed with exception {0}", ex);
+                DefaultTrace.TraceWarning("QueryPartitionProvider.TryCreateServiceProvider failed with exception {0}", ex.Message);
                 return TryCatch<IntPtr>.FromException(ex);
             }
         }

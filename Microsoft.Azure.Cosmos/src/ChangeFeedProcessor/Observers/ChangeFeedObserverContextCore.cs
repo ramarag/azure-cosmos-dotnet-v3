@@ -4,7 +4,6 @@
 
 namespace Microsoft.Azure.Cosmos.ChangeFeed
 {
-    using System;
     using System.Net;
     using System.Threading.Tasks;
     using Microsoft.Azure.Cosmos;
@@ -24,11 +23,13 @@ namespace Microsoft.Azure.Cosmos.ChangeFeed
         internal ChangeFeedObserverContextCore(
             string leaseToken, 
             ResponseMessage feedResponse, 
-            PartitionCheckpointer checkpointer)
+            PartitionCheckpointer checkpointer,
+            FeedRange feedRange)
         {
             this.LeaseToken = leaseToken;
             this.responseMessage = feedResponse;
             this.checkpointer = checkpointer;
+            this.FeedRange = feedRange;
         }
 
         public string LeaseToken { get; }
@@ -36,6 +37,8 @@ namespace Microsoft.Azure.Cosmos.ChangeFeed
         public CosmosDiagnostics Diagnostics => this.responseMessage.Diagnostics;
 
         public Headers Headers => this.responseMessage.Headers;
+
+        public FeedRange FeedRange { get; }
 
         public async Task CheckpointAsync()
         {
@@ -46,6 +49,7 @@ namespace Microsoft.Azure.Cosmos.ChangeFeed
             catch (LeaseLostException leaseLostException)
             {
                 // LeaseLost means another instance stole the lease due to load balancing, so the right status is 412
+#pragma warning disable CDX1002 // DontUseExceptionStackTrace
                 CosmosException cosmosException = CosmosExceptionFactory.Create(
                     statusCode: HttpStatusCode.PreconditionFailed,
                     message: "Lease was lost due to load balancing and will be processed by another instance",
@@ -54,6 +58,7 @@ namespace Microsoft.Azure.Cosmos.ChangeFeed
                     trace: NoOpTrace.Singleton,
                     error: null,
                     innerException: leaseLostException);
+#pragma warning restore CDX1002 // DontUseExceptionStackTrace
                 throw cosmosException;
             }
         }

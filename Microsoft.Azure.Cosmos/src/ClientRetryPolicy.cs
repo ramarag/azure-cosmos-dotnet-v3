@@ -23,26 +23,33 @@ namespace Microsoft.Azure.Cosmos
         private const int RetryIntervalInMS = 1000; // Once we detect failover wait for 1 second before retrying request.
         private const int MaxRetryCount = 120;
         private const int MaxServiceUnavailableRetryCount = 1;
+        private const int MaxSessionTokenRetryCount = 2;
 
         private readonly IDocumentClientRetryPolicy throttlingRetry;
         private readonly GlobalEndpointManager globalEndpointManager;
         private readonly GlobalPartitionEndpointManager partitionKeyRangeLocationCache;
         private readonly bool enableEndpointDiscovery;
+        private readonly bool isThinClientEnabled;
         private int failoverRetryCount;
 
         private int sessionTokenRetryCount;
         private int serviceUnavailableRetryCount;
         private bool isReadRequest;
         private bool canUseMultipleWriteLocations;
+        private bool isMultiMasterWriteRequest;
         private Uri locationEndpoint;
         private RetryContext retryContext;
         private DocumentServiceRequest documentServiceRequest;
+#if !INTERNAL
+        private volatile bool addHubRegionProcessingOnlyHeader;
+#endif
 
         public ClientRetryPolicy(
             GlobalEndpointManager globalEndpointManager,
             GlobalPartitionEndpointManager partitionKeyRangeLocationCache,
+            RetryOptions retryOptions,
             bool enableEndpointDiscovery,
-            RetryOptions retryOptions)
+            bool isThinClientEnabled)
         {
             this.throttlingRetry = new ResourceThrottleRetryPolicy(
                 retryOptions.MaxRetryAttemptsOnThrottledRequests,
@@ -55,6 +62,8 @@ namespace Microsoft.Azure.Cosmos
             this.sessionTokenRetryCount = 0;
             this.serviceUnavailableRetryCount = 0;
             this.canUseMultipleWriteLocations = false;
+            this.isMultiMasterWriteRequest = false;
+            this.isThinClientEnabled = isThinClientEnabled;
         }
 
         /// <summary> 
@@ -75,6 +84,10 @@ namespace Microsoft.Azure.Cosmos
                     this.documentServiceRequest?.RequestContext?.LocationEndpointToRoute?.ToString() ?? string.Empty,
                     this.documentServiceRequest?.ResourceAddress ?? string.Empty);
 
+                // In the event of the routing gateway having outage on region A, mark the partition as unavailable assuming that the
+                // partition has been failed over to region B, when per partition automatic failover is enabled.
+                this.TryMarkEndpointUnavailableForPkRange(isSystemResourceUnavailableForWrite: false);
+
                 // Mark both read and write requests because it gateway exception.
                 // This means all requests going to the region will fail.
                 return await this.ShouldRetryOnEndpointFailureAsync(
@@ -86,12 +99,60 @@ namespace Microsoft.Azure.Cosmos
 
             if (exception is DocumentClientException clientException)
             {
+                // Today, the only scenario where we would treat a throttling (429) exception as service unavailable is when we
+                // get 429 (TooManyRequests) with sub status code 3092 (System Resource Not Available). Note that this is applicable
+                // for write requests targeted to a multiple master account. In such case, the 429/3092 will be treated as 503. The
+                // reason to keep the code out of the throttling retry policy is that in the near future, the 3092 sub status code
+                // might not be a throttling scenario at all and the status code in that case would be different than 429.
+                if (this.ShouldMarkEndpointUnavailableOnSystemResourceUnavailableForWrite(
+                    clientException.StatusCode,
+                    clientException.GetSubStatus()))
+                {
+                    DefaultTrace.TraceError(
+                        "Operation will NOT be retried on local region. Treating SystemResourceUnavailable (429/3092) as ServiceUnavailable (503). Status code: {0}, sub status code: {1}.",
+                        StatusCodes.TooManyRequests, SubStatusCodes.SystemResourceUnavailable);
+
+                    return this.TryMarkEndpointUnavailableForPkRangeAndRetryOnServiceUnavailable(
+                        isSystemResourceUnavailableForWrite: true);
+                }
+
                 ShouldRetryResult shouldRetryResult = await this.ShouldRetryInternalAsync(
                     clientException?.StatusCode,
                     clientException?.GetSubStatus());
                 if (shouldRetryResult != null)
                 {
                     return shouldRetryResult;
+                }
+            }
+
+            // Any metadata request will throw a cosmos exception from CosmosHttpClientCore if
+            // it receives a 503 service unavailable from gateway. This check is to add retry
+            // mechanism for the metadata requests in such cases.
+            if (exception is CosmosException cosmosException)
+            {
+                ShouldRetryResult shouldRetryResult = await this.ShouldRetryInternalAsync(
+                    cosmosException.StatusCode,
+                    cosmosException.Headers.SubStatusCode);
+                if (shouldRetryResult != null)
+                {
+                    return shouldRetryResult;
+                }
+            }
+
+            if (exception is OperationCanceledException)
+            {
+                DefaultTrace.TraceInformation("ClientRetryPolicy: The operation was cancelled. Not retrying. Retry count = {0}, Endpoint = {1}",
+                    this.failoverRetryCount,
+                    this.locationEndpoint?.ToString() ?? string.Empty);
+
+                if (this.partitionKeyRangeLocationCache.IncrementRequestFailureCounterAndCheckIfPartitionCanFailover(
+                        this.documentServiceRequest))
+                {
+                    // In the event of a (ppaf + write operation) or (ppcb + read or multi-master write operation) getting timed
+                    // out due to cancellation token expiration on region A, mark the partition as unavailable assuming that
+                    // the partition has been failed over to region B, when per partition automatic failover is enabled.
+                    this.partitionKeyRangeLocationCache.TryMarkEndpointUnavailableForPartitionKeyRange(
+                         this.documentServiceRequest);
                 }
             }
 
@@ -118,6 +179,23 @@ namespace Microsoft.Azure.Cosmos
                 return shouldRetryResult;
             }
 
+            // Today, the only scenario where we would treat a throttling (429) exception as service unavailable is when we
+            // get 429 (TooManyRequests) with sub status code 3092 (System Resource Not Available). Note that this is applicable
+            // for write requests targeted to a multiple master account. In such case, the 429/3092 will be treated as 503. The
+            // reason to keep the code out of the throttling retry policy is that in the near future, the 3092 sub status code
+            // might not be a throttling scenario at all and the status code in that case would be different than 429.
+            if (this.ShouldMarkEndpointUnavailableOnSystemResourceUnavailableForWrite(
+                cosmosResponseMessage.StatusCode,
+                cosmosResponseMessage?.Headers.SubStatusCode))
+            {
+                DefaultTrace.TraceError(
+                    "Operation will NOT be retried on local region. Treating SystemResourceUnavailable (429/3092) as ServiceUnavailable (503). Status code: {0}, sub status code: {1}.",
+                    StatusCodes.TooManyRequests, SubStatusCodes.SystemResourceUnavailable);
+
+                return this.TryMarkEndpointUnavailableForPkRangeAndRetryOnServiceUnavailable(
+                    isSystemResourceUnavailableForWrite: true);
+            }
+
             return await this.throttlingRetry.ShouldRetryAsync(cosmosResponseMessage, cancellationToken);
         }
 
@@ -131,6 +209,8 @@ namespace Microsoft.Azure.Cosmos
             this.isReadRequest = request.IsReadOnlyRequest;
             this.canUseMultipleWriteLocations = this.globalEndpointManager.CanUseMultipleWriteLocations(request);
             this.documentServiceRequest = request;
+            this.isMultiMasterWriteRequest = !this.isReadRequest
+                && (this.globalEndpointManager?.CanSupportMultipleWriteLocations(request.ResourceType, request.OperationType) ?? false);
 
             // clear previous location-based routing directive
             request.RequestContext.ClearRouteToLocation();
@@ -147,10 +227,20 @@ namespace Microsoft.Azure.Cosmos
                     request.RequestContext.RouteToLocation(this.retryContext.RetryLocationIndex, this.retryContext.RetryRequestOnPreferredLocations);
                 }
             }
-
+#if !INTERNAL
+            // If previous attempt failed with 404/1002, add the hub-region-processing-only header to all subsequent retry attempts
+            if (this.addHubRegionProcessingOnlyHeader)
+            {
+                request.Headers[HttpConstants.HttpHeaders.ShouldProcessOnlyInHubRegion] = bool.TrueString;
+            }
+#endif
             // Resolve the endpoint for the request and pin the resolution to the resolved endpoint
             // This enables marking the endpoint unavailability on endpoint failover/unreachability
-            this.locationEndpoint = this.globalEndpointManager.ResolveServiceEndpoint(request);
+            this.locationEndpoint = this.isThinClientEnabled
+                && GatewayStoreModel.IsOperationSupportedByThinClient(request)
+                ? this.globalEndpointManager.ResolveThinClientEndpoint(request)
+                : this.globalEndpointManager.ResolveServiceEndpoint(request);
+
             request.RequestContext.RouteToLocation(this.locationEndpoint);
         }
 
@@ -173,8 +263,7 @@ namespace Microsoft.Azure.Cosmos
                     this.documentServiceRequest?.ResourceAddress ?? string.Empty);
 
                 // Mark the partition key range as unavailable to retry future request on a new region.
-                this.partitionKeyRangeLocationCache.TryMarkEndpointUnavailableForPartitionKeyRange(
-                     this.documentServiceRequest);
+                this.TryMarkEndpointUnavailableForPkRange(isSystemResourceUnavailableForWrite: false);
             }
 
             // Received 403.3 on write region, initiate the endpoint rediscovery
@@ -233,42 +322,34 @@ namespace Microsoft.Azure.Cosmos
                     this.documentServiceRequest?.RequestContext?.LocationEndpointToRoute?.ToString() ?? string.Empty,
                     this.documentServiceRequest?.ResourceAddress ?? string.Empty);
 
+                //Retry policy will retry on the next preffered region as the original requert region is not accepting requests
                 return await this.ShouldRetryOnEndpointFailureAsync(
                     isReadRequest: this.isReadRequest,
                     markBothReadAndWriteAsUnavailable: false,
                     forceRefresh: false,
-                    retryOnPreferredLocations: false);
+                    retryOnPreferredLocations: true);
             }
 
-            if (statusCode == HttpStatusCode.NotFound
-                && subStatusCode == SubStatusCodes.ReadSessionNotAvailable)
+            if (statusCode == HttpStatusCode.NotFound && subStatusCode == SubStatusCodes.ReadSessionNotAvailable)
             {
-                return this.ShouldRetryOnSessionNotAvailable();
+                return this.ShouldRetryOnSessionNotAvailable(this.documentServiceRequest);
             }
 
             // Received 503 due to client connect timeout or Gateway
-            if (statusCode == HttpStatusCode.ServiceUnavailable
-                && ClientRetryPolicy.IsRetriableServiceUnavailable(subStatusCode))
+            if (statusCode == HttpStatusCode.ServiceUnavailable)
             {
-                DefaultTrace.TraceWarning("ClientRetryPolicy: ServiceUnavailable. Refresh cache and retry. Failed Location: {0}; ResourceAddress: {1}",
-                    this.documentServiceRequest?.RequestContext?.LocationEndpointToRoute?.ToString() ?? string.Empty,
-                    this.documentServiceRequest?.ResourceAddress ?? string.Empty);
+                return this.TryMarkEndpointUnavailableForPkRangeAndRetryOnServiceUnavailable(
+                    isSystemResourceUnavailableForWrite: false);
+            }
 
-                // Mark the partition as unavailable.
-                // Let the ClientRetry logic decide if the request should be retried
-                this.partitionKeyRangeLocationCache.TryMarkEndpointUnavailableForPartitionKeyRange(
-                     this.documentServiceRequest);
-
-                return this.ShouldRetryOnServiceUnavailable();
+            // Recieved 500 status code or lease not found
+            if ((statusCode == HttpStatusCode.InternalServerError && this.isReadRequest)
+                || (statusCode == HttpStatusCode.Gone && subStatusCode == SubStatusCodes.LeaseNotFound))
+            {
+                return this.ShouldRetryOnUnavailableEndpointStatusCodes();
             }
 
             return null;
-        }
-
-        private static bool IsRetriableServiceUnavailable(SubStatusCodes? subStatusCode)
-        {
-            return subStatusCode == SubStatusCodes.Unknown ||
-                (subStatusCode.HasValue && subStatusCode.Value.IsSDKGeneratedSubStatus());
         }
 
         private async Task<ShouldRetryResult> ShouldRetryOnEndpointFailureAsync(
@@ -334,7 +415,7 @@ namespace Microsoft.Azure.Cosmos
             return ShouldRetryResult.RetryAfter(retryDelay);
         }
 
-        private ShouldRetryResult ShouldRetryOnSessionNotAvailable()
+        private ShouldRetryResult ShouldRetryOnSessionNotAvailable(DocumentServiceRequest request)
         {
             this.sessionTokenRetryCount++;
 
@@ -347,7 +428,7 @@ namespace Microsoft.Azure.Cosmos
             {
                 if (this.canUseMultipleWriteLocations)
                 {
-                    ReadOnlyCollection<Uri> endpoints = this.isReadRequest ? this.globalEndpointManager.ReadEndpoints : this.globalEndpointManager.WriteEndpoints;
+                    ReadOnlyCollection<Uri> endpoints = this.globalEndpointManager.GetApplicableEndpoints(request, this.isReadRequest);
 
                     if (this.sessionTokenRetryCount > endpoints.Count)
                     {
@@ -368,12 +449,29 @@ namespace Microsoft.Azure.Cosmos
                 }
                 else
                 {
-                    if (this.sessionTokenRetryCount > 1)
+#if !INTERNAL
+                    // Only set the hub region processing header for single master accounts.
+                    // Set header after the second consecutive 404/1002 (count >= 2 means both
+                    // the initial request and the first retry to the write region have failed).
+                    if (this.sessionTokenRetryCount >= MaxSessionTokenRetryCount)
                     {
-                        // When cannot use multiple write locations, then don't retry the request if 
-                        // we have already tried this request on the write location
+                        this.addHubRegionProcessingOnlyHeader = true;
+                    }
+
+                    if (this.sessionTokenRetryCount > MaxSessionTokenRetryCount)
+                    {
+                        // Hub region header was set at count == MaxSessionTokenRetryCount and the
+                        // request was retried with it. If the hub still returns 404/1002, stop.
                         return ShouldRetryResult.NoRetry();
                     }
+#else
+                    if (this.sessionTokenRetryCount > 1)
+                    {
+                        // When cannot use multiple write locations, then don't retry the request if
+                        // we have already tried this request on the write location.
+                        return ShouldRetryResult.NoRetry();
+                    }
+#endif
                     else
                     {
                         this.retryContext = new RetryContext
@@ -389,10 +487,33 @@ namespace Microsoft.Azure.Cosmos
         }
 
         /// <summary>
-        /// For a ServiceUnavailable (503.0) we could be having a timeout from Direct/TCP locally or a request to Gateway request with a similar response due to an endpoint not yet available.
-        /// We try and retry the request only if there are other regions available.
+        /// Attempts to mark the endpoint associated with the current partition key range as unavailable and determines if
+        /// a retry should be performed due to a ServiceUnavailable (503) response. This method is invoked when a 503
+        /// Service Unavailable response is received, indicating that the service might be temporarily unavailable.
+        /// It optionally marks the partition key range as unavailable, which will influence future routing decisions.
         /// </summary>
-        private ShouldRetryResult ShouldRetryOnServiceUnavailable()
+        /// <param name="isSystemResourceUnavailableForWrite">A boolean flag indicating whether the endpoint for the
+        /// current partition key range should be marked as unavailable, if the failure happened due to system
+        /// resource unavailability.</param>
+        /// <returns>An instance of <see cref="ShouldRetryResult"/> indicating whether the operation should be retried.</returns>
+        private ShouldRetryResult TryMarkEndpointUnavailableForPkRangeAndRetryOnServiceUnavailable(
+            bool isSystemResourceUnavailableForWrite)
+        {
+            DefaultTrace.TraceWarning("ClientRetryPolicy: ServiceUnavailable. Refresh cache and retry. Failed Location: {0}; ResourceAddress: {1}",
+                this.documentServiceRequest?.RequestContext?.LocationEndpointToRoute?.ToString() ?? string.Empty,
+                this.documentServiceRequest?.ResourceAddress ?? string.Empty);
+
+            this.TryMarkEndpointUnavailableForPkRange(isSystemResourceUnavailableForWrite);
+
+            return this.ShouldRetryOnUnavailableEndpointStatusCodes();
+        }
+
+        /// <summary>
+        /// For a ServiceUnavailable (503.0) we could be having a timeout from Direct/TCP locally or a request to Gateway request with a similar response due to an endpoint not yet available.
+        /// We try and retry the request only if there are other regions available. The retry logic is applicable for single master write accounts as well.
+        /// Other status codes include InternalServerError (500.0) and LeaseNotFound (410.1022).
+        /// </summary>
+        private ShouldRetryResult ShouldRetryOnUnavailableEndpointStatusCodes()
         {
             if (this.serviceUnavailableRetryCount++ >= ClientRetryPolicy.MaxServiceUnavailableRetryCount)
             {
@@ -401,9 +522,11 @@ namespace Microsoft.Azure.Cosmos
             }
 
             if (!this.canUseMultipleWriteLocations
-                    && !this.isReadRequest)
+                    && !this.isReadRequest
+                    && !this.partitionKeyRangeLocationCache.IsPartitionLevelAutomaticFailoverEnabled())
             {
-                // Write requests on single master cannot be retried, no other regions available
+                // Write requests on single master cannot be retried if partition level failover is disabled.
+                // This means there are no other regions available to serve the writes.
                 return ShouldRetryResult.NoRetry();
             }
 
@@ -427,6 +550,74 @@ namespace Microsoft.Azure.Cosmos
             };
 
             return ShouldRetryResult.RetryAfter(TimeSpan.Zero);
+        }
+
+        /// <summary>
+        /// Attempts to mark the endpoint associated with the current partition key range as unavailable
+        /// which will influence future routing decisions.
+        /// </summary>
+        /// <param name="isSystemResourceUnavailableForWrite">A boolean flag indicating if the system resource was unavailable. If true,
+        /// the endpoint will be marked unavailable for the pk-range of a multi master write request, bypassing the circuit breaker check.</param>
+        /// <returns>A boolean flag indicating whether the endpoint was marked as unavailable.</returns>
+        private bool TryMarkEndpointUnavailableForPkRange(
+            bool isSystemResourceUnavailableForWrite)
+        {
+            if (this.documentServiceRequest != null
+                && (isSystemResourceUnavailableForWrite
+                || this.IsRequestEligibleForPerPartitionAutomaticFailover()
+                || this.IsRequestEligibleForPartitionLevelCircuitBreaker()))
+            {
+                // Mark the partition as unavailable.
+                // Let the ClientRetry logic decide if the request should be retried
+                return this.partitionKeyRangeLocationCache.TryMarkEndpointUnavailableForPartitionKeyRange(
+                    request: this.documentServiceRequest);
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Returns a boolean flag indicating if the endpoint should be marked as unavailable
+        /// due to a 429 response with a sub status code of 3092 (system resource unavailable).
+        /// This is applicable for write requests targeted for multi master accounts.
+        /// </summary>
+        /// <param name="statusCode">An instance of <see cref="HttpStatusCode"/> containing the status code.</param>
+        /// <param name="subStatusCode">An instance of <see cref="SubStatusCodes"/> containing the sub status code.</param>
+        /// <returns>A boolean flag indicating is the endpoint should be marked as unavailable.</returns>
+        private bool ShouldMarkEndpointUnavailableOnSystemResourceUnavailableForWrite(
+            HttpStatusCode? statusCode,
+            SubStatusCodes? subStatusCode)
+        {
+            return this.isMultiMasterWriteRequest
+                && statusCode.HasValue
+                && (int)statusCode.Value == (int)StatusCodes.TooManyRequests
+                && subStatusCode == SubStatusCodes.SystemResourceUnavailable;
+        }
+
+        /// <summary>
+        /// Determines if a request is eligible for per-partition automatic failover.
+        /// A request is eligible if it is a write request, partition level failover is enabled,
+        /// and the global endpoint manager cannot use multiple write locations for the request.
+        /// </summary>
+        /// <returns>True if the request is eligible for per-partition automatic failover, otherwise false.</returns>
+        private bool IsRequestEligibleForPerPartitionAutomaticFailover()
+        {
+            return this.partitionKeyRangeLocationCache.IsRequestEligibleForPerPartitionAutomaticFailover(
+                this.documentServiceRequest);
+        }
+
+        /// <summary>
+        /// Determines if a request is eligible for partition-level circuit breaker.
+        /// This method checks if the request is a read-only request or a multi master write request, if partition-level circuit breaker is enabled,
+        /// and if the partition key range location cache indicates that the partition can fail over based on the number of request failures.
+        /// </summary>
+        /// <returns>
+        /// True if the read request is eligible for partition-level circuit breaker, otherwise false.
+        /// </returns>
+        private bool IsRequestEligibleForPartitionLevelCircuitBreaker()
+        {
+            return this.partitionKeyRangeLocationCache.IsRequestEligibleForPartitionLevelCircuitBreaker(this.documentServiceRequest)
+                        && this.partitionKeyRangeLocationCache.IncrementRequestFailureCounterAndCheckIfPartitionCanFailover(this.documentServiceRequest);
         }
 
         private sealed class RetryContext

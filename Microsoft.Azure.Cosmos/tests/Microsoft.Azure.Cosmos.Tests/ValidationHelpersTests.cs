@@ -28,7 +28,7 @@ namespace Microsoft.Azure.Cosmos.Tests
                 {
                     continue;
                 }
-                
+
                 foreach (KeyValuePair<Documents.OperationType, bool> entry in ValidationHelpersTest.GetPerOperationExpectations())
                 {
                     bool result = ValidationHelpers.IsValidConsistencyLevelOverwrite(backendConsistencyLevel,
@@ -75,7 +75,8 @@ namespace Microsoft.Azure.Cosmos.Tests
                         Documents.OperationTypeExtensions.IsReadOperation(operationType)
                             && operationType != Documents.OperationType.Head
                             && operationType != Documents.OperationType.HeadFeed
-                            && operationType != Documents.OperationType.QueryPlan);
+                            && operationType != Documents.OperationType.QueryPlan
+                            && operationType != Documents.OperationType.MetadataCheckAccess);
             }
 
             return perOperationOverride;

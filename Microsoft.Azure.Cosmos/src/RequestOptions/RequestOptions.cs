@@ -6,8 +6,8 @@ namespace Microsoft.Azure.Cosmos
 {
     using System;
     using System.Collections.Generic;
+    using System.Globalization;
     using Microsoft.Azure.Documents;
-    using Telemetry;
 
     /// <summary>
     /// The default cosmos request options
@@ -18,16 +18,27 @@ namespace Microsoft.Azure.Cosmos
         /// Gets or sets the If-Match (ETag) associated with the request in the Azure Cosmos DB service.
         /// </summary>
         /// <remarks>
-        /// Most commonly used with the Delete* and Replace* methods of <see cref="Container"/> such as <see cref="Container.ReplaceItemAsync{T}(T, string, PartitionKey?, ItemRequestOptions, System.Threading.CancellationToken)"/>
-        /// but can be used with other methods like <see cref="Container.ReadItemAsync{T}(string, PartitionKey, ItemRequestOptions, System.Threading.CancellationToken)"/> for caching scenarios.
+        /// Most commonly used with the Delete* and Replace* methods of <see cref="Container"/> such as <see cref="Container.ReplaceItemAsync{T}(T, string, PartitionKey?, ItemRequestOptions, System.Threading.CancellationToken)"/>.
+        /// <see cref="Container.CreateItemAsync{T}(T, PartitionKey?, ItemRequestOptions, System.Threading.CancellationToken)"/> will ignore <see cref="IfMatchEtag"/> if specificed. 
+        /// <see cref="Container.UpsertItemAsync{T}(T, PartitionKey?, ItemRequestOptions, System.Threading.CancellationToken)"/> will ignore <see cref="IfMatchEtag"/> when materialized as Create, otherwise for Replace Etag constraint will be applied.
+        /// 
+        /// <seealso href="https://learn.microsoft.com/en-us/azure/cosmos-db/nosql/database-transactions-optimistic-concurrency#implementing-optimistic-concurrency-control-using-etag-and-http-headers"/>
         /// </remarks>
         public string IfMatchEtag { get; set; }
 
         /// <summary>
+        /// Most commonly used to detect changes to the resource
         /// Gets or sets the If-None-Match (ETag) associated with the request in the Azure Cosmos DB service.
         /// </summary>
         /// <remarks>
-        /// Most commonly used to detect changes to the resource
+        /// Most commonly used with reads such as <see cref="Container.ReadItemAsync{T}(string, PartitionKey, ItemRequestOptions, System.Threading.CancellationToken)"/>.
+        /// When Item Etag matches the specified <see cref="IfNoneMatchEtag"/> then 304 status code will be returned, otherwise existing Item will be returned with 200.
+        /// <see cref="Container.UpsertItemAsync{T}(T, PartitionKey?, ItemRequestOptions, System.Threading.CancellationToken)"/> will ignore <see cref="IfNoneMatchEtag"/> when materialized as Create, otherwise for Replace Etag constraint will be applied.
+        /// 
+        /// To match any Etag use "*"
+        /// If specified for writes (ex: Create, Replace, Delete) will be ignored.
+        /// 
+        /// <seealso href="https://learn.microsoft.com/en-us/azure/cosmos-db/nosql/database-transactions-optimistic-concurrency#implementing-optimistic-concurrency-control-using-etag-and-http-headers"/>
         /// </remarks>
         public string IfNoneMatchEtag { get; set; }
 
@@ -48,6 +59,7 @@ namespace Microsoft.Azure.Cosmos
         /// <remarks>
         /// Setting priority level only has an effect if Priority Based Execution is enabled.
         /// If it is not enabled, the priority level is ignored by the backend.
+        /// If <see cref="CosmosClientOptions.AllowBulkExecution"/> is set to true on CosmosClient, priority level set in RequestOptions is ignored.
         /// Default PriorityLevel for each request is treated as High. It can be explicitly set to Low for some requests.
         /// When Priority based execution is enabled, if there are more requests than the configured RU/S in a second, 
         /// then Cosmos DB will throttle low priority requests to allow high priority requests to execute.
@@ -56,17 +68,28 @@ namespace Microsoft.Azure.Cosmos
         /// configured RU/s, low priority requests start getting throttled first to allow execution of mission critical workloads.
         /// </remarks>
         /// <seealso href="https://aka.ms/CosmosDB/PriorityBasedExecution"/>
-#if PREVIEW
-        public
-#else
-        internal
-#endif
-        PriorityLevel? PriorityLevel { get; set; }
+        public PriorityLevel? PriorityLevel { get; set; }
 
         /// <summary>
-        /// Set Request Level Distributed Tracing Options.
+        /// Threshold values for Distributed Tracing. 
+        /// These values decides whether to generate operation level <see cref="System.Diagnostics.Tracing.EventSource"/> with request diagnostics or not.
         /// </summary>
-        internal DistributedTracingOptions DistributedTracingOptions { get; set; }
+        public CosmosThresholdOptions CosmosThresholdOptions { get; set; }
+
+        /// <summary>
+        /// List of regions to be excluded routing the request to.
+        /// This can be used to route a request to a specific region by excluding all other regions.
+        /// If all regions are excluded, the SDK will route the request on a best-effort basis to maintain availability.
+        /// </summary>
+        public List<string> ExcludeRegions { get; set; }
+
+        /// <summary>
+        /// Cosmos availability strategy.
+        /// Availability strategy allows the SDK to send out additional cross region requests to help 
+        /// reduce latency and increase availability. Currently there is one type of availability strategy, parallel request hedging.
+        /// If there is a globally enabled availability strategy, setting one in the request options will override the global one.
+        /// </summary>
+        public AvailabilityStrategy AvailabilityStrategy { get; set; }
 
         /// <summary>
         /// Gets or sets the boolean to use effective partition key routing in the cosmos db request.
@@ -86,7 +109,28 @@ namespace Microsoft.Azure.Cosmos
         /// </remarks>
         internal virtual ConsistencyLevel? BaseConsistencyLevel { get; set; }
 
+        /// <summary>
+        /// Gets or sets the read consistency strategy for the request.
+        /// When set, this takes precedence over <see cref="BaseConsistencyLevel"/>.
+        /// </summary>
+        internal virtual ReadConsistencyStrategy? BaseReadConsistencyStrategy { get; set; }
+
         internal bool DisablePointOperationDiagnostics { get; set; }
+
+        /// <summary>
+        /// Gets or sets the throughput bucket for a request.
+        /// </summary>
+        /// <remarks>
+        /// If <see cref="CosmosClientOptions.AllowBulkExecution"/> is set to true on CosmosClient,
+        /// <see cref="RequestOptions.ThroughputBucket"/> cannot be set in RequestOptions.
+        /// </remarks>
+        /// <seealso href="https://aka.ms/cosmsodb-bucketing"/>
+#if PREVIEW
+        public
+#else
+        internal
+#endif
+        int? ThroughputBucket { get; set; }
 
         /// <summary>
         /// Fill the CosmosRequestMessage headers with the set properties
@@ -115,6 +159,11 @@ namespace Microsoft.Azure.Cosmos
             if (this.PriorityLevel.HasValue)
             {
                 request.Headers.Add(HttpConstants.HttpHeaders.PriorityLevel, this.PriorityLevel.ToString());
+            }
+
+            if (this.ThroughputBucket.HasValue)
+            {
+                request.Headers.Add(HttpConstants.HttpHeaders.ThroughputBucket, this.ThroughputBucket?.ToString(CultureInfo.InvariantCulture));
             }
 
             this.AddRequestHeaders?.Invoke(request.Headers);
@@ -164,5 +213,25 @@ namespace Microsoft.Azure.Cosmos
                 request.Headers.Add(HttpConstants.HttpHeaders.SessionToken, sessionToken);
             }
         }
+
+        /// <summary>
+        /// Gets or sets the configuration for operation-level metrics.
+        /// </summary>
+#if PREVIEW
+        public
+#else
+        internal
+#endif
+        OperationMetricsOptions OperationMetricsOptions { get; set; } = null;
+
+        /// <summary>
+        /// Gets or sets the configuration for network-level metrics.
+        /// </summary>
+#if PREVIEW
+        public
+#else
+        internal
+#endif
+        NetworkMetricsOptions NetworkMetricsOptions { get; set; } = null;
     }
 }

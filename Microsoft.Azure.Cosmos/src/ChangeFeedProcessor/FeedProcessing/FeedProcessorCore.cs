@@ -54,7 +54,7 @@ namespace Microsoft.Azure.Cosmos.ChangeFeed.FeedProcessing
                             if (!ReferenceEquals(await Task.WhenAny(task, Task.Delay(this.options.RequestTimeout, cts.Token)), task))
                             {
                                 Task catchExceptionFromTask = task.ContinueWith(task => DefaultTrace.TraceInformation(
-                                "Timed out Change Feed request failed with exception: {2}", task.Exception.InnerException),
+                                "Timed out Change Feed request failed with exception: {2}", task.Exception.Message),
                                 TaskContinuationOptions.OnlyOnFaulted);
                                 throw CosmosExceptionFactory.CreateRequestTimeoutException("Change Feed request timed out", new Headers());
                             }
@@ -125,7 +125,11 @@ namespace Microsoft.Azure.Cosmos.ChangeFeed.FeedProcessing
 
         private Task DispatchChangesAsync(ResponseMessage response, CancellationToken cancellationToken)
         {
-            ChangeFeedObserverContextCore context = new ChangeFeedObserverContextCore(this.options.LeaseToken, response, this.checkpointer);
+            ChangeFeedObserverContextCore context = new ChangeFeedObserverContextCore(
+                this.options.LeaseToken,
+                response,
+                this.checkpointer,
+                this.options.FeedRange);
             return this.observer.ProcessChangesAsync(context, response.Content, cancellationToken);
         }
     }

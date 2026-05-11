@@ -14,7 +14,7 @@ namespace Microsoft.Azure.Cosmos
     using System.Text;
     using System.Threading;
     using System.Threading.Tasks;
-    using Microsoft.Azure.Cosmos.Handlers;
+    using Microsoft.Azure.Cosmos.Routing;
     using Microsoft.Azure.Cosmos.Tracing.TraceData;
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Collections;
@@ -23,18 +23,22 @@ namespace Microsoft.Azure.Cosmos
     internal class GatewayStoreClient : TransportClient
     {
         private readonly ICommunicationEventSource eventSource;
-        private readonly CosmosHttpClient httpClient;
-        private readonly JsonSerializerSettings SerializerSettings;
+        private readonly GlobalPartitionEndpointManager globalPartitionEndpointManager;
+        protected readonly CosmosHttpClient httpClient;
+        protected readonly JsonSerializerSettings SerializerSettings;
+
         private static readonly HttpMethod httpPatchMethod = new HttpMethod(HttpConstants.HttpMethods.Patch);
 
         public GatewayStoreClient(
             CosmosHttpClient httpClient,
             ICommunicationEventSource eventSource,
+            GlobalPartitionEndpointManager globalPartitionEndpointManager,
             JsonSerializerSettings serializerSettings = null)
         {
             this.httpClient = httpClient;
             this.SerializerSettings = serializerSettings;
             this.eventSource = eventSource;
+            this.globalPartitionEndpointManager = globalPartitionEndpointManager;
         }
 
         public async Task<DocumentServiceResponse> InvokeAsync(
@@ -47,6 +51,18 @@ namespace Microsoft.Azure.Cosmos
             {
                 return await GatewayStoreClient.ParseResponseAsync(responseMessage, request.SerializerSettings ?? this.SerializerSettings, request);
             }
+        }
+
+        public virtual Task<DocumentServiceResponse> InvokeAsync(
+            DocumentServiceRequest request,
+            ResourceType resourceType,
+            Uri physicalAddress,
+            Uri endpoint,
+            string globalDatabaseAccountName,
+            ClientCollectionCache clientCollectionCache,
+            CancellationToken cancellationToken)
+        {
+            return this.InvokeAsync(request, resourceType, physicalAddress, cancellationToken);
         }
 
         public static bool IsFeedRequest(OperationType requestOperationType)
@@ -132,69 +148,85 @@ namespace Microsoft.Azure.Cosmos
             return headers;
         }
 
+        /// <summary>
+        /// Creating a new DocumentClientException using the Gateway response message.
+        /// </summary>
+        /// <param name="responseMessage"></param>
+        /// <param name="requestStatistics"></param>
         internal static async Task<DocumentClientException> CreateDocumentClientExceptionAsync(
             HttpResponseMessage responseMessage,
             IClientSideRequestStatistics requestStatistics)
         {
-            bool isNameBased = false;
-            bool isFeed = false;
-            string resourceTypeString;
-            string resourceIdOrFullName;
-
-            string resourceLink = responseMessage.RequestMessage.RequestUri.LocalPath;
-            if (!PathsHelper.TryParsePathSegments(resourceLink, out isFeed, out resourceTypeString, out resourceIdOrFullName, out isNameBased))
+            if (!PathsHelper.TryParsePathSegments(
+                resourceUrl: responseMessage.RequestMessage.RequestUri.LocalPath,
+                isFeed: out _,
+                resourcePath: out _,
+                resourceIdOrFullName: out string resourceIdOrFullName,
+                isNameBased: out _))
             {
                 // if resourceLink is invalid - we will not set resourceAddress in exception.
             }
 
             // If service rejects the initial payload like header is to large it will return an HTML error instead of JSON.
-            if (string.Equals(responseMessage.Content?.Headers?.ContentType?.MediaType, "application/json", StringComparison.OrdinalIgnoreCase))
+            string contentString = null;
+            if (string.Equals(responseMessage.Content?.Headers?.ContentType?.MediaType, "application/json", StringComparison.OrdinalIgnoreCase) &&
+                responseMessage.Content?.Headers.ContentLength > 0)
             {
-                Stream readStream = await responseMessage.Content.ReadAsStreamAsync();
-                Error error = Documents.Resource.LoadFrom<Error>(readStream);
-                return new DocumentClientException(
-                    error,
-                    responseMessage.Headers,
-                    responseMessage.StatusCode)
+                try
                 {
-                    StatusDescription = responseMessage.ReasonPhrase,
-                    ResourceAddress = resourceIdOrFullName,
-                    RequestStatistics = requestStatistics
-                };
-            }
-            else
-            {
-                StringBuilder context = new StringBuilder();
-                context.AppendLine(await responseMessage.Content.ReadAsStringAsync());
-
-                HttpRequestMessage requestMessage = responseMessage.RequestMessage;
-                if (requestMessage != null)
-                {
-                    context.AppendLine($"RequestUri: {requestMessage.RequestUri.ToString()};");
-                    context.AppendLine($"RequestMethod: {requestMessage.Method.Method};");
-
-                    if (requestMessage.Headers != null)
+                    // Buffer the content once to avoid "stream already consumed" issue
+                    contentString = await responseMessage.Content.ReadAsStringAsync();
+                    using (MemoryStream contentStream = new MemoryStream(Encoding.UTF8.GetBytes(contentString)))
                     {
-                        foreach (KeyValuePair<string, IEnumerable<string>> header in requestMessage.Headers)
+                        Error error = JsonSerializable.LoadFrom<Error>(stream: contentStream);
+
+                        return new DocumentClientException(
+                            errorResource: error,
+                            responseHeaders: responseMessage.Headers,
+                            statusCode: responseMessage.StatusCode)
                         {
-                            context.AppendLine($"Header: {header.Key} Length: {string.Join(",", header.Value).Length};");
-                        }
+                            StatusDescription = responseMessage.ReasonPhrase,
+                            ResourceAddress = resourceIdOrFullName,
+                            RequestStatistics = requestStatistics
+                        };
                     }
                 }
-
-                String message = await responseMessage.Content.ReadAsStringAsync();
-                return new DocumentClientException(
-                    message: context.ToString(),
-                    innerException: null,
-                    responseHeaders: responseMessage.Headers,
-                    statusCode: responseMessage.StatusCode,
-                    requestUri: responseMessage.RequestMessage.RequestUri)
+                catch
                 {
-                    StatusDescription = responseMessage.ReasonPhrase,
-                    ResourceAddress = resourceIdOrFullName,
-                    RequestStatistics = requestStatistics
-                };
+                }
             }
+
+            StringBuilder contextBuilder = new StringBuilder();
+            // Reuse the already buffered content if available, otherwise read it now
+            contextBuilder.AppendLine(contentString ?? await responseMessage.Content.ReadAsStringAsync());
+
+            HttpRequestMessage requestMessage = responseMessage.RequestMessage;
+
+            if (requestMessage != null)
+            {
+                contextBuilder.AppendLine($"RequestUri: {requestMessage.RequestUri};");
+                contextBuilder.AppendLine($"RequestMethod: {requestMessage.Method.Method};");
+
+                if (requestMessage.Headers != null)
+                {
+                    foreach (KeyValuePair<string, IEnumerable<string>> header in requestMessage.Headers)
+                    {
+                        contextBuilder.AppendLine($"Header: {header.Key} Length: {string.Join(",", header.Value).Length};");
+                    }
+                }
+            }
+
+            return new DocumentClientException(
+                message: contextBuilder.ToString(),
+                innerException: null,
+                responseHeaders: responseMessage.Headers,
+                statusCode: responseMessage.StatusCode,
+                requestUri: responseMessage.RequestMessage.RequestUri)
+            {
+                StatusDescription = responseMessage.ReasonPhrase,
+                ResourceAddress = resourceIdOrFullName,
+                RequestStatistics = requestStatistics
+            };
         }
 
         internal static bool IsAllowedRequestHeader(string headerName)
@@ -240,7 +272,7 @@ namespace Microsoft.Azure.Cosmos
         }
 
         [SuppressMessage("Microsoft.Reliability", "CA2000:DisposeObjectsBeforeLosingScope", Justification = "Disposable object returned by method")]
-        private async ValueTask<HttpRequestMessage> PrepareRequestMessageAsync(
+        internal async ValueTask<HttpRequestMessage> PrepareRequestMessageAsync(
             DocumentServiceRequest request,
             Uri physicalAddress)
         {
@@ -250,6 +282,7 @@ namespace Microsoft.Azure.Cosmos
                 request.OperationType == OperationType.Query ||
                 request.OperationType == OperationType.SqlQuery ||
                 request.OperationType == OperationType.Batch ||
+                request.OperationType == OperationType.CommitDistributedTransaction ||
                 request.OperationType == OperationType.ExecuteJavaScript ||
                 request.OperationType == OperationType.QueryPlan ||
                 (request.ResourceType == ResourceType.PartitionKey && request.OperationType == OperationType.Delete))
@@ -338,7 +371,7 @@ namespace Microsoft.Azure.Cosmos
             {
                 requestMessage.Properties.Add(ClientSideRequestStatisticsTraceDatum.HttpRequestRegionNameProperty, regionName);
             }
-            
+
             return requestMessage;
         }
 
@@ -352,9 +385,18 @@ namespace Microsoft.Azure.Cosmos
             return this.httpClient.SendHttpAsync(
                 () => this.PrepareRequestMessageAsync(request, physicalAddress),
                 resourceType,
-                HttpTimeoutPolicy.GetTimeoutPolicy(request),
+                HttpTimeoutPolicy.GetTimeoutPolicy(
+                    request,
+                    this.IsPartitionLevelFailoverEnabled()),
                 request.RequestContext.ClientRequestStatistics,
-                cancellationToken);
+                cancellationToken,
+                request);
+        }
+
+        private bool IsPartitionLevelFailoverEnabled()
+        {
+            return this.globalPartitionEndpointManager.IsPartitionLevelCircuitBreakerEnabled()
+                || this.globalPartitionEndpointManager.IsPartitionLevelAutomaticFailoverEnabled();
         }
     }
 }

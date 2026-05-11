@@ -114,7 +114,7 @@ namespace Microsoft.Azure.Cosmos.Tests
             {
                 { HttpConstants.HttpHeaders.Continuation, continuation }
             };
-            Range<string> range = partitionRoutingHelper.ExtractPartitionKeyRangeFromContinuationToken(headers, out List<CompositeContinuationToken> compositeContinuationTokens);
+            Range<string> range = partitionRoutingHelper.ExtractPartitionKeyRangeFromContinuationToken(headers, out _);
             Assert.IsTrue(expectedRange.Equals(range));
             Assert.AreEqual(expectedToken, headers.Get(HttpConstants.HttpHeaders.Continuation)); //not a composite token
         }
@@ -651,17 +651,24 @@ namespace Microsoft.Azure.Cosmos.Tests
             containerProperties.Id = "TestContainer";
             containerProperties.PartitionKey = partitionKeyDefinition;
 
+            Mock<IDocumentClientInternal> mockDocumentClient = new Mock<IDocumentClientInternal>();
+            mockDocumentClient.Setup(client => client.ServiceEndpoint).Returns(new Uri("https://foo"));
 
-            Mock<Common.CollectionCache> collectionCache = new Mock<Common.CollectionCache>(MockBehavior.Strict);
+            using GlobalEndpointManager endpointManager = new(mockDocumentClient.Object, new ConnectionPolicy());
+
+            Mock<Common.CollectionCache> collectionCache = new Mock<Common.CollectionCache>(MockBehavior.Strict, false);
             collectionCache.Setup(c => c.ResolveCollectionAsync(It.IsAny<DocumentServiceRequest>(), default, trace))
                 .ReturnsAsync(containerProperties);
 
-            CollectionRoutingMap collectionRoutingMap = CollectionRoutingMap.TryCreateCompleteRoutingMap(new List<Tuple<PartitionKeyRange, ServiceIdentity>>(), collectionRid);
+            CollectionRoutingMap collectionRoutingMap = CollectionRoutingMap.TryCreateCompleteRoutingMap(new List<Tuple<PartitionKeyRange, ServiceIdentity>>(), collectionRid, false);
             Mock<PartitionKeyRangeCache> partitionKeyRangeCache = new Mock<PartitionKeyRangeCache>(
                 MockBehavior.Strict,
                 new Mock<ICosmosAuthorizationTokenProvider>().Object,
                 new Mock<IStoreModel>().Object,
-                collectionCache.Object);
+                collectionCache.Object,
+                endpointManager,
+                false,
+                false);
             partitionKeyRangeCache.Setup(c => c.TryLookupAsync(collectionRid, null, It.IsAny<DocumentServiceRequest>(), trace))
                 .ReturnsAsync(collectionRoutingMap);
 

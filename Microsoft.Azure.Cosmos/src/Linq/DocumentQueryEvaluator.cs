@@ -15,9 +15,9 @@ namespace Microsoft.Azure.Cosmos.Linq
     {
         private const string SQLMethod = "AsSQL";
 
-        public static SqlQuerySpec Evaluate(
+        public static LinqQueryOperation Evaluate(
             Expression expression,
-            CosmosLinqSerializerOptions linqSerializerOptions = null,
+            CosmosLinqSerializerOptionsInternal linqSerializerOptions = null,
             IDictionary<object, string> parameters = null)
         {
             switch (expression.NodeType)
@@ -51,7 +51,7 @@ namespace Microsoft.Azure.Cosmos.Linq
         /// foreach(Database db in client.CreateDatabaseQuery()) {}        
         /// </summary>
         /// <param name="expression"></param>
-        private static SqlQuerySpec HandleEmptyQuery(ConstantExpression expression)
+        private static LinqQueryOperation HandleEmptyQuery(ConstantExpression expression)
         {
             if (expression.Value == null)
             {
@@ -69,14 +69,15 @@ namespace Microsoft.Azure.Cosmos.Linq
                     ClientResources.BadQuery_InvalidExpression,
                     expression.ToString()));
             }
+
             //No query specified.
-            return null;
+            return new LinqQueryOperation(sqlQuerySpec: null, scalarOperationKind: ScalarOperationKind.None);
         }
 
-        private static SqlQuerySpec HandleMethodCallExpression(
+        private static LinqQueryOperation HandleMethodCallExpression(
             MethodCallExpression expression,
             IDictionary<object, string> parameters,
-            CosmosLinqSerializerOptions linqSerializerOptions = null)
+            CosmosLinqSerializerOptionsInternal linqSerializerOptions = null)
         {
             if (DocumentQueryEvaluator.IsTransformExpression(expression))
             {
@@ -100,7 +101,7 @@ namespace Microsoft.Azure.Cosmos.Linq
         /// foreach(string record in client.CreateDocumentQuery().Navigate("Raw JQuery"))
         /// </summary>
         /// <param name="expression"></param>
-        private static SqlQuerySpec HandleAsSqlTransformExpression(MethodCallExpression expression)
+        private static LinqQueryOperation HandleAsSqlTransformExpression(MethodCallExpression expression)
         {
             Expression paramExpression = expression.Arguments[1];
 
@@ -108,7 +109,7 @@ namespace Microsoft.Azure.Cosmos.Linq
             {
                 LambdaExpression lambdaExpression = (LambdaExpression)paramExpression;
                 // Send the lambda expression through the partial evaluator.
-                return GetSqlQuerySpec(lambdaExpression.Compile().DynamicInvoke(null));
+                return GetSqlQuerySpec(lambdaExpression.Compile(preferInterpretation: true).DynamicInvoke(null));
             }
             else if (paramExpression.NodeType == ExpressionType.Constant)
             {
@@ -118,11 +119,11 @@ namespace Microsoft.Azure.Cosmos.Linq
             else
             {
                 LambdaExpression lamdaExpression = Expression.Lambda(paramExpression);
-                return GetSqlQuerySpec(lamdaExpression.Compile().DynamicInvoke(null));
+                return GetSqlQuerySpec(lamdaExpression.Compile(preferInterpretation: true).DynamicInvoke(null));
             }
         }
 
-        private static SqlQuerySpec GetSqlQuerySpec(object value)
+        private static LinqQueryOperation GetSqlQuerySpec(object value)
         {
             if (value == null)
             {
@@ -133,11 +134,11 @@ namespace Microsoft.Azure.Cosmos.Linq
             }
             else if (value.GetType() == typeof(SqlQuerySpec))
             {
-                return (SqlQuerySpec)value;
+                return new LinqQueryOperation((SqlQuerySpec)value, ScalarOperationKind.None);
             }
             else if (value.GetType() == typeof(string))
             {
-                return new SqlQuerySpec((string)value);
+                return new LinqQueryOperation(new SqlQuerySpec((string)value), ScalarOperationKind.None);
             }
             else
             {

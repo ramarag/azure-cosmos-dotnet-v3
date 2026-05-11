@@ -14,6 +14,7 @@ namespace Microsoft.Azure.Cosmos.ChangeFeed
     using Microsoft.Azure.Cosmos.ChangeFeed.Utils;
     using Microsoft.Azure.Cosmos.Core.Trace;
     using Microsoft.Azure.Cosmos.Tracing;
+    using Microsoft.Azure.Documents;
 
     internal sealed class ChangeFeedProcessorCore : ChangeFeedProcessor
     {
@@ -57,6 +58,15 @@ namespace Microsoft.Azure.Cosmos.ChangeFeed
         {
             if (!this.initialized)
             {
+                if (!this.changeFeedProcessorOptions.StartFromBeginning
+                    && this.changeFeedProcessorOptions.StartTime == null
+                    && string.IsNullOrEmpty(this.changeFeedProcessorOptions.StartContinuation))
+                {
+                    // StartTime is serialized as RFC1123 (seconds precision) and interpreted as exclusive.
+                    // Back off by one second so writes occurring immediately after StartAsync are not missed.
+                    this.changeFeedProcessorOptions.StartTime = DateTime.UtcNow.AddSeconds(-1);
+                }
+
                 await this.InitializeAsync().ConfigureAwait(false);
             }
 
@@ -68,26 +78,50 @@ namespace Microsoft.Azure.Cosmos.ChangeFeed
         public override async Task StopAsync()
         {
             DefaultTrace.TraceInformation("Stopping processor...");
+
+            // Persist in-memory lease state before stopping the partition manager so that
+            // a subsequent partition-manager shutdown failure cannot prevent recovery of the
+            // lease snapshot. No-op for Cosmos-backed leases.
+            await this.documentServiceLeaseStoreManager.ShutdownAsync().ConfigureAwait(false);
+
             await this.partitionManager.StopAsync().ConfigureAwait(false);
+
             DefaultTrace.TraceInformation("Processor stopped.");
         }
 
         private async Task InitializeAsync()
         {
             string containerRid = await this.monitoredContainer.GetCachedRIDAsync(
-                forceRefresh: false, 
-                NoOpTrace.Singleton, 
+                forceRefresh: false,
+                NoOpTrace.Singleton,
                 default);
+
             string monitoredDatabaseAndContainerRid = await this.monitoredContainer.GetMonitoredDatabaseAndContainerRidAsync();
             string leaseContainerPrefix = this.monitoredContainer.GetLeasePrefix(this.changeFeedLeaseOptions.LeasePrefix, monitoredDatabaseAndContainerRid);
             Routing.PartitionKeyRangeCache partitionKeyRangeCache = await this.monitoredContainer.ClientContext.DocumentClient.GetPartitionKeyRangeCacheAsync(NoOpTrace.Singleton);
             if (this.documentServiceLeaseStoreManager == null)
             {
-                this.documentServiceLeaseStoreManager = await DocumentServiceLeaseStoreManagerBuilder.InitializeAsync(this.monitoredContainer, this.leaseContainer, leaseContainerPrefix, this.instanceName).ConfigureAwait(false);
+                this.documentServiceLeaseStoreManager = await DocumentServiceLeaseStoreManagerBuilder
+                    .InitializeAsync(
+                        this.monitoredContainer,
+                        this.leaseContainer,
+                        leaseContainerPrefix,
+                        this.instanceName,
+                        changeFeedMode: this.changeFeedProcessorOptions.Mode)
+                    .ConfigureAwait(false);
             }
 
+            this.documentServiceLeaseStoreManager
+                .LeaseManager
+                .ChangeFeedModeSwitchingCheck(
+                    documentServiceLeases: await this.documentServiceLeaseStoreManager
+                        .LeaseContainer
+                            .GetAllLeasesAsync()
+                            .ConfigureAwait(false),
+                    changeFeedLeaseOptionsMode: this.changeFeedLeaseOptions.Mode);
+
             this.partitionManager = this.BuildPartitionManager(
-                containerRid, 
+                containerRid,
                 partitionKeyRangeCache);
             this.initialized = true;
         }

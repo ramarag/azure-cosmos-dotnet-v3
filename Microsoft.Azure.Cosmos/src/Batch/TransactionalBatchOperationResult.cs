@@ -99,6 +99,11 @@ namespace Microsoft.Azure.Cosmos
         internal virtual string SessionToken { get; set; }
 
         /// <summary>
+        /// A string containing the partition key range id assigned to this result.
+        /// </summary>
+        internal virtual string PartitionKeyRangeId { get; set; }
+
+        /// <summary>
         /// ActivityId related to the operation
         /// </summary>
         internal virtual string ActivityId { get; set; }
@@ -178,8 +183,14 @@ namespace Microsoft.Azure.Cosmos
                             return r;
                         }
 
-                        batchOperationResult.ResourceStream = new MemoryStream(
-                            buffer: resourceBody, index: 0, count: resourceBody.Length, writable: false, publiclyVisible: true);
+                        batchOperationResult.ResourceStream = new CloneableStream(
+                            internalStream: new MemoryStream(
+                                buffer: resourceBody,
+                                index: 0,
+                                count: resourceBody.Length,
+                                writable: false,
+                                publiclyVisible: true),
+                            allowUnsafeDataAccess: true);
                         break;
 
                     case "requestCharge":
@@ -218,6 +229,7 @@ namespace Microsoft.Azure.Cosmos
                 RetryAfter = this.RetryAfter,
                 RequestCharge = this.RequestCharge,
                 Session = this.SessionToken,
+                PartitionKeyRangeId = this.PartitionKeyRangeId,
                 ActivityId = this.ActivityId,
             };
 

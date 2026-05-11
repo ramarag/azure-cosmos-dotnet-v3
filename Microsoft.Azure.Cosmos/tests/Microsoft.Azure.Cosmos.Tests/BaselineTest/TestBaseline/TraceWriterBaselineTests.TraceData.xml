@@ -126,7 +126,7 @@
     {
         QueryMetricsTraceDatum datum = new QueryMetricsTraceDatum(
             new Lazy<QueryMetrics>(() => new QueryMetrics(
-                BackendMetricsTests.MockBackendMetrics,
+                ServerSideMetricsTests.ServerSideMetrics,
                 IndexUtilizationInfoTests.MockIndexUtilizationInfo,
                 ClientSideMetricsTests.MockClientSideMetrics)));
         rootTrace.AddDatum("Query Metrics", datum);
@@ -187,7 +187,7 @@
         TraceForBaselineTesting rootTrace;
         using (rootTrace = TraceForBaselineTesting.GetRootTrace())
         {
-            ClientSideRequestStatisticsTraceDatum datum = new ClientSideRequestStatisticsTraceDatum(DateTime.MinValue, new TraceSummary());
+            ClientSideRequestStatisticsTraceDatum datum = new ClientSideRequestStatisticsTraceDatum(DateTime.MinValue, rootTrace);
 
             TransportAddressUri uri1 = new TransportAddressUri(new Uri("http://someUri1.com"));
             TransportAddressUri uri2 = new TransportAddressUri(new Uri("http://someUri2.com"));
@@ -218,7 +218,8 @@
                 ResourceType.Document,
                 OperationType.Query,
                 "42",
-                uri1.Uri);
+                uri1.Uri,
+                "region1");
 
             TraceWriterBaselineTests.GetPrivateField<List<StoreResponseStatistics>>(datum, "storeResponseStatistics").Add(storeResponseStatistics);
             rootTrace.AddDatum("Client Side Request Stats", datum);
@@ -317,6 +318,7 @@
       "StoreResponseStatistics": [
         {
           "ResponseTimeUTC": "9999-12-31T23:59:59.9999999",
+          "DurationInMs": 315537897600000,
           "ResourceType": "Document",
           "OperationType": "Query",
           "RequestSessionToken": "42",
@@ -328,6 +330,7 @@
             "LSN": 1337,
             "PartitionKeyRangeId": "42",
             "GlobalCommittedLSN": 1234,
+            "GlobalNRegionCommittedGLSN": -1,
             "ItemLSN": 15,
             "UsingLocalLSN": true,
             "QuorumAckedLSN": 23,
@@ -340,6 +343,12 @@
             "RequestCharge": 3.14,
             "RetryAfterInMs": "9000",
             "BELatencyInMs": "4.2",
+            "ReplicaHealthStatuses": [
+              "http://storephysicaladdress-1p.com:Connected",
+              "http://storephysicaladdress-2s.com:Unknown",
+              "http://storephysicaladdress-3s.com:Unhealthy",
+              "http://storephysicaladdress-4s.com:Unknown"
+            ],
             "transportRequestTimeline": {
               "requestTimeline": [
                 {
@@ -405,7 +414,7 @@
         TraceForBaselineTesting rootTrace;
         using (rootTrace = TraceForBaselineTesting.GetRootTrace())
         {
-            ClientSideRequestStatisticsTraceDatum datum = new ClientSideRequestStatisticsTraceDatum(DateTime.MinValue, new TraceSummary());
+            ClientSideRequestStatisticsTraceDatum datum = new ClientSideRequestStatisticsTraceDatum(DateTime.MinValue, rootTrace);
             datum.ContactedReplicas.Add(default);
 
             TraceWriterBaselineTests.GetPrivateField<Dictionary<string, AddressResolutionStatistics>>(datum, "endpointToAddressResolutionStats").Add("asdf", default);
@@ -424,7 +433,8 @@
                 resourceType: default,
                 operationType: default,
                 requestSessionToken: default,
-                locationEndpoint: default);
+                locationEndpoint: default,
+                region: "region1");
 
             TraceWriterBaselineTests.GetPrivateField<List<StoreResponseStatistics>>(datum, "storeResponseStatistics").Add(storeResponseStatistics);
             rootTrace.AddDatum("Client Side Request Stats Default", datum);
@@ -507,6 +517,7 @@
       "StoreResponseStatistics": [
         {
           "ResponseTimeUTC": "0001-01-01T00:00:00",
+          "DurationInMs": null,
           "ResourceType": "Database",
           "OperationType": "Create",
           "LocationEndpoint": null,
@@ -517,6 +528,7 @@
             "LSN": 0,
             "PartitionKeyRangeId": null,
             "GlobalCommittedLSN": 0,
+            "GlobalNRegionCommittedGLSN": 0,
             "ItemLSN": 0,
             "UsingLocalLSN": false,
             "QuorumAckedLSN": 0,
@@ -529,6 +541,7 @@
             "RequestCharge": 0,
             "RetryAfterInMs": null,
             "BELatencyInMs": null,
+            "ReplicaHealthStatuses": [],
             "transportRequestTimeline": null,
             "TransportException": null
           }
@@ -546,7 +559,7 @@
         TraceForBaselineTesting rootTrace;
         using (rootTrace = TraceForBaselineTesting.GetRootTrace())
         {
-            ClientSideRequestStatisticsTraceDatum datum = new ClientSideRequestStatisticsTraceDatum(DateTime.MinValue, new TraceSummary());
+            ClientSideRequestStatisticsTraceDatum datum = new ClientSideRequestStatisticsTraceDatum(DateTime.MinValue, rootTrace);
             TraceWriterBaselineTests.SetEndRequestTime(datum,DateTime.MaxValue);
 
             HttpResponseStatistics httpResponseStatistics = new HttpResponseStatistics(
@@ -556,7 +569,8 @@
                 HttpMethod.Get,
                 ResourceType.Document,
                 new HttpResponseMessage(System.Net.HttpStatusCode.OK) { ReasonPhrase = "Success" },
-                exception: null);
+                exception: null,
+                region: "region1");
 
             TraceWriterBaselineTests.GetPrivateField<List<HttpResponseStatistics>>(datum, "httpResponseStatistics").Add(httpResponseStatistics);
 
@@ -567,7 +581,8 @@
                 HttpMethod.Get,
                 ResourceType.Document,
                 responseMessage: null,
-                exception: new OperationCanceledException());
+                exception: new OperationCanceledException(),
+                region: "region1");
             TraceWriterBaselineTests.GetPrivateField<List<HttpResponseStatistics>>(datum, "httpResponseStatistics").Add(httpResponseStatisticsException);
 
             rootTrace.AddDatum("Client Side Request Stats", datum);

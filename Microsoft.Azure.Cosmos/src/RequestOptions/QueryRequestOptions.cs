@@ -7,8 +7,8 @@ namespace Microsoft.Azure.Cosmos
     using System;
     using System.Text;
     using Microsoft.Azure.Cosmos.CosmosElements;
+    using Microsoft.Azure.Cosmos.Query;
     using Microsoft.Azure.Cosmos.Query.Core;
-    using Microsoft.Azure.Cosmos.Query.Core.Pipeline;
     using Microsoft.Azure.Documents;
 
     /// <summary>
@@ -44,12 +44,12 @@ namespace Microsoft.Azure.Cosmos
         public bool? EnableLowPrecisionOrderBy { get; set; }
 
         /// <summary>
-        /// Gets or sets the option for customers to opt in for direct (optimistic) execution of the query..
+        /// Gets or sets the option for customers to opt in for direct (optimistic) execution of the query.
         /// </summary>
         /// <value>
         /// Direct (optimistic) execution offers improved performance for several kinds of queries such as a single partition streaming query.
         /// </value>
-        internal bool EnableOptimisticDirectExecution { get; set; }
+        public bool EnableOptimisticDirectExecution { get; set; } = ConfigurationManager.IsOptimisticDirectExecutionEnabled(defaultValue: false);
 
         /// <summary>
         /// Gets or sets the maximum number of items that can be buffered client side during 
@@ -105,13 +105,45 @@ namespace Microsoft.Azure.Cosmos
         /// </summary>
         /// <remarks>
         /// <para> 
-        /// PopulateIndexMetrics is used to obtain the index metrics to understand how the query engine used existing indexes 
+        /// <c>PopulateIndexMetrics</c> is used to obtain the index metrics to understand how the query engine used existing indexes 
         /// and how it could use potential new indexes.
-        /// The results will be displayed in FeedResponse.IndexMetrics. Please note that this options will incur overhead, so it should be 
+        /// The results will be displayed in <c>FeedResponse.IndexMetrics</c>. Please note that this options will incur overhead, so it should be 
         /// enabled only when debugging slow queries.
         /// </para>
         /// </remarks>
         public bool? PopulateIndexMetrics { get; set; }
+
+        /// <summary>
+        /// Gets or sets the <see cref="PopulateQueryAdvice"/> request option for document query requests in the Azure Cosmos DB service.
+        /// </summary>
+        /// <remarks>
+        /// <para> 
+        /// <c>PopulateQueryAdvice</c> is used to obtain the query advice to understand aspect of the query that can be optimized.
+        /// The results will be displayed in <c>FeedResponse.QueryAdvice</c>. Please note that this options will incur overhead, so it should be 
+        /// enabled only when debugging queries.
+        /// </para>
+        /// <example>
+        /// <code>
+        /// <![CDATA[
+        /// var queryRequestOptions = new QueryRequestOptions { PopulateQueryAdvice = true};
+        /// 
+        /// // View results in FeedResponse.QueryAdvice
+        /// string queryAdvice = null;
+        /// while (itemQuery.HasMoreResults)
+        ///    {
+        ///        FeedResponse<CosmosElement> page = itemQuery.ReadNextAsync().Result;
+        ///        
+        ///        // query advice is the same across pages so we only need to log it once
+        ///        if (queryAdvice == null)
+        ///        {
+        ///             queryAdvice = page.QueryAdvice; 
+        ///        }
+        ///    }
+        /// ]]>
+        /// </code>
+        /// </example>
+        /// </remarks>
+        public bool? PopulateQueryAdvice { get; set; }
 
         /// <summary>
         /// Gets or sets the consistency level required for the request in the Azure Cosmos DB service.
@@ -130,6 +162,25 @@ namespace Microsoft.Azure.Cosmos
         {
             get => this.BaseConsistencyLevel;
             set => this.BaseConsistencyLevel = value;
+        }
+
+        /// <summary>
+        /// Gets or sets the <see cref="ReadConsistencyStrategy"/> for the request.
+        /// </summary>
+        /// <remarks>
+        /// When set, this takes precedence over <see cref="ConsistencyLevel"/> for query operations.
+        /// The <see cref="ReadConsistencyStrategy.GlobalStrong"/> strategy is only valid
+        /// for accounts configured with Strong consistency.
+        /// </remarks>
+#if PREVIEW
+        public
+#else
+        internal
+#endif
+        ReadConsistencyStrategy? ReadConsistencyStrategy
+        {
+            get => this.BaseReadConsistencyStrategy;
+            set => this.BaseReadConsistencyStrategy = value;
         }
 
         /// <summary>
@@ -170,6 +221,32 @@ namespace Microsoft.Azure.Cosmos
         /// </summary>
         public DedicatedGatewayRequestOptions DedicatedGatewayRequestOptions { get; set; }
 
+        /// <summary>
+        /// Enables printing query in Traces db.query.text attribute. By default, query is not printed.
+        /// Users have the option to enable printing parameterized or all queries, 
+        /// but has to beware that customer data may be shown when the later option is chosen. It's the user's responsibility to sanitize the queries if necessary.
+        /// </summary>
+        public QueryTextMode QueryTextMode { get; set; } = QueryTextMode.None;
+
+        /// <summary>
+        /// Gets or sets the scope for computing BM25 statistics used by FullTextScore in hybrid search queries.
+        /// </summary>
+        /// <value>
+        /// The scope for computing BM25 statistics. Defaults to <see cref="FullTextScoreScope.Global"/>.
+        /// </value>
+        /// <remarks>
+        /// <para>
+        /// When set to <see cref="FullTextScoreScope.Global"/>, BM25 statistics (term frequency, inverse document frequency,
+        /// and document length) are computed across all documents in the container, including all physical and logical partitions.
+        /// </para>
+        /// <para>
+        /// When set to <see cref="FullTextScoreScope.Local"/>, statistics are computed only over the subset of documents
+        /// within the partition key values specified in the query request. This is useful for multi-tenant scenarios where scoring
+        /// should reflect statistics that are accurate for a specific tenant's dataset.
+        /// </para>
+        /// </remarks>
+        public FullTextScoreScope FullTextScoreScope { get; set; } = FullTextScoreScope.Global;
+
         internal CosmosElement CosmosElementContinuationToken { get; set; }
 
         internal string StartId { get; set; }
@@ -180,13 +257,20 @@ namespace Microsoft.Azure.Cosmos
 
         internal CosmosSerializationFormatOptions CosmosSerializationFormatOptions { get; set; }
 
-        internal ExecutionEnvironment? ExecutionEnvironment { get; set; }
+        internal SupportedSerializationFormats? SupportedSerializationFormats { get; set; }
 
         internal bool? ReturnResultsInDeterministicOrder { get; set; }
 
         internal TestInjections TestSettings { get; set; }
 
         internal FeedRange FeedRange { get; set; }
+
+        internal bool IsHybridSearchQueryPlanOptimizationDisabled { get; set; } = ConfigurationManager.IsHybridSearchQueryPlanOptimizationDisabled(defaultValue: false);
+
+        // This is a temporary flag to enable the distributed query gateway mode.
+        // This flag will be removed once we have a way for the client to determine
+        // that we are talking to a distributed query gateway.
+        internal bool EnableDistributedQueryGatewayMode { get; set; } = ConfigurationManager.IsDistributedQueryGatewayModeEnabled(defaultValue: false);
 
         /// <summary>
         /// Fill the CosmosRequestMessage headers with the set properties
@@ -233,9 +317,12 @@ namespace Microsoft.Azure.Cosmos
                 request.Headers.Add(HttpConstants.HttpHeaders.ResponseContinuationTokenLimitInKB, this.ResponseContinuationTokenLimitInKb.ToString());
             }
 
-            if (this.CosmosSerializationFormatOptions != null)
+            // All query APIs (GetItemQueryIterator, GetItemLinqQueryable and GetItemQueryStreamIterator) turn into ReadFeed operation if query text is null.
+            // In such a case, query pipelines are still involved (including QueryRequestOptions). In general backend only honors SupportedSerializationFormats
+            //  for OperationType Query but has a bug where it returns a binary response for ReadFeed API when partition key is also specified in the request.
+            if (request.OperationType == OperationType.Query)
             {
-                request.Headers.CosmosMessageHeaders.ContentSerializationFormat = this.CosmosSerializationFormatOptions.ContentSerializationFormat;
+                request.Headers.CosmosMessageHeaders.SupportedSerializationFormats = this.SupportedSerializationFormats?.ToString() ?? DocumentQueryExecutionContextBase.DefaultSupportedSerializationFormats;
             }
 
             if (this.StartId != null)
@@ -260,10 +347,16 @@ namespace Microsoft.Azure.Cosmos
 
             if (this.PopulateIndexMetrics.HasValue)
             {
-                request.Headers.CosmosMessageHeaders.Add(HttpConstants.HttpHeaders.PopulateIndexMetrics, this.PopulateIndexMetrics.ToString());
+                request.Headers.CosmosMessageHeaders.Add(HttpConstants.HttpHeaders.PopulateIndexMetricsV2, this.PopulateIndexMetrics.ToString());
+            }
+
+            if (this.PopulateQueryAdvice.HasValue)
+            {
+                request.Headers.CosmosMessageHeaders.Add(HttpConstants.HttpHeaders.PopulateQueryAdvice, this.PopulateQueryAdvice.ToString());
             }
 
             DedicatedGatewayRequestOptions.PopulateMaxIntegratedCacheStalenessOption(this.DedicatedGatewayRequestOptions, request);
+            DedicatedGatewayRequestOptions.PopulateBypassIntegratedCacheOption(this.DedicatedGatewayRequestOptions, request);
 
             request.Headers.Add(HttpConstants.HttpHeaders.PopulateQueryMetrics, bool.TrueString);
 

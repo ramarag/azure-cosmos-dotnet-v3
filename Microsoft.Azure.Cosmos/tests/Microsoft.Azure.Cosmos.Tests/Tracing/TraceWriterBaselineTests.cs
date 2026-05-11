@@ -23,7 +23,6 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
     using Microsoft.Azure.Cosmos.Query.Core.Metrics;
     using Microsoft.Azure.Cosmos.Query.Core.Monads;
     using Microsoft.Azure.Cosmos.Query.Core.Pipeline;
-    using Microsoft.Azure.Cosmos.Query.Core.Pipeline.Pagination;
     using Microsoft.Azure.Cosmos.Query.Core.QueryPlan;
     using Microsoft.Azure.Cosmos.ReadFeed;
     using Microsoft.Azure.Cosmos.ReadFeed.Pagination;
@@ -41,7 +40,7 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
     public sealed class TraceWriterBaselineTests : BaselineTests<TraceWriterBaselineTests.Input, TraceWriterBaselineTests.Output>
     {
         private static readonly Lazy<QueryMetrics> MockQueryMetrics = new Lazy<QueryMetrics>(() => new QueryMetrics(
-            BackendMetricsTests.MockBackendMetrics,
+            ServerSideMetricsTests.ServerSideMetrics,
             IndexUtilizationInfoTests.MockIndexUtilizationInfo,
             ClientSideMetricsTests.MockClientSideMetrics));
 
@@ -316,7 +315,7 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
                 {
                     QueryMetricsTraceDatum datum = new QueryMetricsTraceDatum(
                         new Lazy<QueryMetrics>(() => new QueryMetrics(
-                            BackendMetricsTests.MockBackendMetrics,
+                            ServerSideMetricsTests.ServerSideMetrics,
                             IndexUtilizationInfoTests.MockIndexUtilizationInfo,
                             ClientSideMetricsTests.MockClientSideMetrics)));
                     rootTrace.AddDatum("Query Metrics", datum);
@@ -336,7 +335,7 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
                     TraceForBaselineTesting rootTrace;
                     using (rootTrace = TraceForBaselineTesting.GetRootTrace())
                     {
-                        ClientSideRequestStatisticsTraceDatum datum = new ClientSideRequestStatisticsTraceDatum(DateTime.MinValue, new TraceSummary());
+                        ClientSideRequestStatisticsTraceDatum datum = new ClientSideRequestStatisticsTraceDatum(DateTime.MinValue, rootTrace);
 
                         TransportAddressUri uri1 = new TransportAddressUri(new Uri("http://someUri1.com"));
                         TransportAddressUri uri2 = new TransportAddressUri(new Uri("http://someUri2.com"));
@@ -367,7 +366,8 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
                             ResourceType.Document,
                             OperationType.Query,
                             "42",
-                            uri1.Uri);
+                            uri1.Uri,
+                            "region1");
 
                         TraceWriterBaselineTests.GetPrivateField<List<StoreResponseStatistics>>(datum, "storeResponseStatistics").Add(storeResponseStatistics);
                         rootTrace.AddDatum("Client Side Request Stats", datum);
@@ -382,7 +382,7 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
                     TraceForBaselineTesting rootTrace;
                     using (rootTrace = TraceForBaselineTesting.GetRootTrace())
                     {
-                        ClientSideRequestStatisticsTraceDatum datum = new ClientSideRequestStatisticsTraceDatum(DateTime.MinValue, new TraceSummary());
+                        ClientSideRequestStatisticsTraceDatum datum = new ClientSideRequestStatisticsTraceDatum(DateTime.MinValue, rootTrace);
                         datum.ContactedReplicas.Add(default);
 
                         TraceWriterBaselineTests.GetPrivateField<Dictionary<string, AddressResolutionStatistics>>(datum, "endpointToAddressResolutionStats").Add("asdf", default);
@@ -401,7 +401,8 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
                             resourceType: default,
                             operationType: default,
                             requestSessionToken: default,
-                            locationEndpoint: default);
+                            locationEndpoint: default,
+                            region: "region1");
 
                         TraceWriterBaselineTests.GetPrivateField<List<StoreResponseStatistics>>(datum, "storeResponseStatistics").Add(storeResponseStatistics);
                         rootTrace.AddDatum("Client Side Request Stats Default", datum);
@@ -416,7 +417,7 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
                     TraceForBaselineTesting rootTrace;
                     using (rootTrace = TraceForBaselineTesting.GetRootTrace())
                     {
-                        ClientSideRequestStatisticsTraceDatum datum = new ClientSideRequestStatisticsTraceDatum(DateTime.MinValue, new TraceSummary());
+                        ClientSideRequestStatisticsTraceDatum datum = new ClientSideRequestStatisticsTraceDatum(DateTime.MinValue, rootTrace);
                         TraceWriterBaselineTests.SetEndRequestTime(datum,DateTime.MaxValue);
 
                         HttpResponseStatistics httpResponseStatistics = new HttpResponseStatistics(
@@ -426,7 +427,8 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
                             HttpMethod.Get,
                             ResourceType.Document,
                             new HttpResponseMessage(System.Net.HttpStatusCode.OK) { ReasonPhrase = "Success" },
-                            exception: null);
+                            exception: null,
+                            region: "region1");
 
                         TraceWriterBaselineTests.GetPrivateField<List<HttpResponseStatistics>>(datum, "httpResponseStatistics").Add(httpResponseStatistics);
 
@@ -437,7 +439,8 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
                             HttpMethod.Get,
                             ResourceType.Document,
                             responseMessage: null,
-                            exception: new OperationCanceledException());
+                            exception: new OperationCanceledException(),
+                            region: "region1");
                         TraceWriterBaselineTests.GetPrivateField<List<HttpResponseStatistics>>(datum, "httpResponseStatistics").Add(httpResponseStatisticsException);
 
                         rootTrace.AddDatum("Client Side Request Stats", datum);
@@ -526,14 +529,13 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
                 CrossPartitionReadFeedAsyncEnumerator enumerator = CrossPartitionReadFeedAsyncEnumerator.Create(
                     documentContainer,
                     new CrossFeedRangeState<ReadFeedState>(ReadFeedCrossFeedRangeState.CreateFromBeginning().FeedRangeStates),
-                    new ReadFeedPaginationOptions(pageSizeHint: 10),
-                    cancellationToken: default);
+                    new ReadFeedExecutionOptions(pageSizeHint: 10));
 
                 int numChildren = 1; // One extra since we need to read one past the last user page to get the null continuation.
                 TraceForBaselineTesting rootTrace;
                 using (rootTrace = TraceForBaselineTesting.GetRootTrace())
                 {
-                    while (await enumerator.MoveNextAsync(rootTrace))
+                    while (await enumerator.MoveNextAsync(rootTrace, cancellationToken: default))
                     {
                         numChildren++;
                     }
@@ -557,16 +559,15 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
                     documentContainer,
                     new CrossFeedRangeState<ChangeFeedState>(
                         ChangeFeedCrossFeedRangeState.CreateFromBeginning().FeedRangeStates),
-                    new ChangeFeedPaginationOptions(
+                    new ChangeFeedExecutionOptions(
                         ChangeFeedMode.Incremental,
-                        pageSizeHint: int.MaxValue),
-                    cancellationToken: default);
+                        pageSizeHint: int.MaxValue));
 
                 int numChildren = 0;
                 TraceForBaselineTesting rootTrace;
                 using (rootTrace = TraceForBaselineTesting.GetRootTrace())
                 {
-                    while (await enumerator.MoveNextAsync(rootTrace))
+                    while (await enumerator.MoveNextAsync(rootTrace, cancellationToken: default))
                     {
                         numChildren++;
 
@@ -597,7 +598,7 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
                 int numChildren = (await documentContainer.GetFeedRangesAsync(NoOpTrace.Singleton, default)).Count; // One extra since we need to read one past the last user page to get the null continuation.
                 using (rootTrace = TraceForBaselineTesting.GetRootTrace())
                 {
-                    while (await pipelineStage.MoveNextAsync(rootTrace))
+                    while (await pipelineStage.MoveNextAsync(rootTrace, cancellationToken: default))
                     {
                         numChildren++;
                     }
@@ -701,22 +702,22 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
             transportRequestStats.RecordState(TransportRequestStats.RequestStage.Received);
             transportRequestStats.RecordState(TransportRequestStats.RequestStage.Completed);
 
-            FieldInfo field = transportRequestStats.GetType().GetField("requestCreatedTime", BindingFlags.NonPublic | BindingFlags.Instance);
+            PropertyInfo field = transportRequestStats.GetType().GetRuntimeProperty("requestCreatedTime");
             field.SetValue(transportRequestStats, defaultDateTime);
 
-            field = transportRequestStats.GetType().GetField("channelAcquisitionStartedTime", BindingFlags.NonPublic | BindingFlags.Instance);
+            field = transportRequestStats.GetType().GetRuntimeProperty("channelAcquisitionStartedTime");
             field.SetValue(transportRequestStats, TimeSpan.FromMilliseconds(1));
 
-            field = transportRequestStats.GetType().GetField("requestPipelinedTime", BindingFlags.NonPublic | BindingFlags.Instance);
+            field = transportRequestStats.GetType().GetRuntimeProperty("requestPipelinedTime");
             field.SetValue(transportRequestStats, TimeSpan.FromMilliseconds(1));
 
-            field = transportRequestStats.GetType().GetField("requestSentTime", BindingFlags.NonPublic | BindingFlags.Instance);
+            field = transportRequestStats.GetType().GetRuntimeProperty("requestSentTime");
             field.SetValue(transportRequestStats, TimeSpan.FromMilliseconds(1));
 
-            field = transportRequestStats.GetType().GetField("requestReceivedTime", BindingFlags.NonPublic | BindingFlags.Instance);
+            field = transportRequestStats.GetType().GetRuntimeProperty("requestReceivedTime");
             field.SetValue(transportRequestStats, TimeSpan.FromMilliseconds(1));
 
-            field = transportRequestStats.GetType().GetField("requestCompletedTime", BindingFlags.NonPublic | BindingFlags.Instance);
+            field = transportRequestStats.GetType().GetRuntimeProperty("requestCompletedTime");
             field.SetValue(transportRequestStats, TimeSpan.FromMilliseconds(1));
 
             transportRequestStats.RequestSizeInBytes = 2;
@@ -751,15 +752,18 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
         private static IQueryPipelineStage CreatePipeline(IDocumentContainer documentContainer, string query, int pageSize = 10, CosmosElement state = null)
         {
             TryCatch<IQueryPipelineStage> tryCreatePipeline = PipelineFactory.MonadicCreate(
-                ExecutionEnvironment.Compute,
                 documentContainer,
                 new SqlQuerySpec(query),
-                new List<FeedRangeEpk>() { FeedRangeEpk.FullRange },
+                targetRanges: new List<FeedRangeEpk>() { FeedRangeEpk.FullRange },
                 partitionKey: null,
                 GetQueryPlan(query),
-                new QueryPaginationOptions(pageSizeHint: pageSize),
+                hybridSearchQueryInfo: null,
+                maxItemCount: pageSize,
+                containerQueryProperties: new Cosmos.Query.Core.QueryClient.ContainerQueryProperties(),
+                allRanges: new List<FeedRangeEpk>() { FeedRangeEpk.FullRange },
+                isContinuationExpected: true,
                 maxConcurrency: 10,
-                requestCancellationToken: default,
+                fullTextScoreScope: FullTextScoreScope.Global,
                 requestContinuationToken: state);
 
             tryCreatePipeline.ThrowIfFailed();
@@ -772,11 +776,13 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
             TryCatch<PartitionedQueryExecutionInfoInternal> info = QueryPartitionProviderTestInstance.Object.TryGetPartitionedQueryExecutionInfoInternal(
                 Newtonsoft.Json.JsonConvert.SerializeObject(new SqlQuerySpec(query)),
                 partitionKeyDefinition,
+                vectorEmbeddingPolicy: null,
                 requireFormattableOrderByQuery: true,
                 isContinuationExpected: false,
                 allowNonValueAggregateQuery: true,
                 hasLogicalPartitionKey: false,
                 allowDCount: true,
+                hybridSearchSkipOrderByRewrite: false,
                 useSystemPrefix: false,
                 geospatialType: Cosmos.GeospatialType.Geography);
 
@@ -825,7 +831,7 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
                         .Join(
                             Environment.NewLine,
                             codeSnippet
-                                .Select(x => x != string.Empty ? x.Substring("            ".Length) : string.Empty))
+                                .Select(x => x != string.Empty ? x["            ".Length..] : string.Empty))
                     + Environment.NewLine;
                 }
                 catch(Exception)
@@ -900,6 +906,8 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
 
             public IReadOnlyDictionary<string, object> Data => this.data;
 
+            public bool IsBeingWalked => true; // needs to return true to allow materialization
+
             public IReadOnlyList<(string, Uri)> RegionsContacted => new List<(string, Uri)>();
 
             public void AddDatum(string key, TraceDatum traceDatum)
@@ -938,7 +946,7 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
                 return new TraceForBaselineTesting("Trace For Baseline Testing", TraceLevel.Info, TraceComponent.Unknown, parent: null);
             }
 
-            public void UpdateRegionContacted(TraceDatum traceDatum)
+            public void UpdateRegionContacted(TraceDatum _)
             {
                 //NoImplementation
             }
@@ -946,6 +954,11 @@ namespace Microsoft.Azure.Cosmos.Tests.Tracing
             public void AddOrUpdateDatum(string key, object value)
             {
                 this.data[key] = value;
+            }
+
+            bool ITrace.TryGetDatum(string key, out object datum)
+            {
+                return this.data.TryGetValue(key, out datum);
             }
         }
     }

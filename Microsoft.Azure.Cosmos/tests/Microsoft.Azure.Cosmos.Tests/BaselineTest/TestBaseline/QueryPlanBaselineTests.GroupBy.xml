@@ -10,7 +10,10 @@
       <PartitionKeyType>Hash</PartitionKeyType>
     </Input>
     <Output>
-      <Exception>TryCatch resulted in an exception.</Exception>
+      <Exception>Microsoft.Azure.Cosmos.Query.Core.Monads.ExceptionWithStackTraceException : TryCatch resulted in an exception.
+Microsoft.Azure.Cosmos.Query.Core.Exceptions.ExpectedQueryPartitionProviderException : {"Errors":["Compositions of aggregates and other expressions are not allowed."]}
+System.Runtime.InteropServices.COMException : 0x800A0B00
+</Exception>
     </Output>
   </Result>
   <Result>
@@ -24,7 +27,10 @@
       <PartitionKeyType>Hash</PartitionKeyType>
     </Input>
     <Output>
-      <Exception>TryCatch resulted in an exception.</Exception>
+      <Exception>Microsoft.Azure.Cosmos.Query.Core.Monads.ExceptionWithStackTraceException : TryCatch resulted in an exception.
+Microsoft.Azure.Cosmos.Query.Core.Exceptions.ExpectedQueryPartitionProviderException : {"errors":[{"severity":"Error","location":{"start":24,"end":25},"code":"SC2041","message":"'SELECT *' is not allowed with GROUP BY."}]}
+System.Runtime.InteropServices.COMException : 0x800A0B00
+</Exception>
     </Output>
   </Result>
   <Result>
@@ -38,7 +44,10 @@
       <PartitionKeyType>Hash</PartitionKeyType>
     </Input>
     <Output>
-      <Exception>TryCatch resulted in an exception.</Exception>
+      <Exception>Microsoft.Azure.Cosmos.Query.Core.Monads.ExceptionWithStackTraceException : TryCatch resulted in an exception.
+Microsoft.Azure.Cosmos.Query.Core.Exceptions.ExpectedQueryPartitionProviderException : {"errors":[{"severity":"Error","location":{"start":24,"end":25},"code":"SC2041","message":"'SELECT *' is not allowed with GROUP BY."}]}
+System.Runtime.InteropServices.COMException : 0x800A0B00
+</Exception>
     </Output>
   </Result>
   <Result>
@@ -119,6 +128,124 @@ GROUP BY {"age": c.age}]]></RewrittenQuery>
   </Result>
   <Result>
     <Input>
+      <Description>SELECT VALUE object create with non-object create GROUP BY</Description>
+      <Query>
+                SELECT VALUE {"age": c.age}
+                FROM c
+                GROUP BY c.age</Query>
+      <PartitionKeys />
+      <PartitionKeyType>Hash</PartitionKeyType>
+    </Input>
+    <Output>
+      <PartitionedQueryExecutionInfoInternal>
+        <QueryInfo>
+          <DistinctType>None</DistinctType>
+          <Top />
+          <Offset />
+          <Limit />
+          <GroupByExpressions>
+            <GroupByExpression>c.age</GroupByExpression>
+          </GroupByExpressions>
+          <OrderBy />
+          <OrderByExpressions />
+          <Aggregates />
+          <GroupByAliasToAggregateType />
+          <GroupByAliases />
+          <HasSelectValue>True</HasSelectValue>
+        </QueryInfo>
+        <QueryRanges>
+          <Range>
+            <Range>[[],"Infinity")</Range>
+          </Range>
+        </QueryRanges>
+        <RewrittenQuery><![CDATA[SELECT [{"item": c.age}] AS groupByItems, {"age": c.age} AS payload
+FROM c
+GROUP BY c.age]]></RewrittenQuery>
+      </PartitionedQueryExecutionInfoInternal>
+    </Output>
+  </Result>
+  <Result>
+    <Input>
+      <Description>SELECT VALUE aggregate average</Description>
+      <Query>
+                SELECT VALUE AVG(c.age)
+                FROM c
+                GROUP BY c.age</Query>
+      <PartitionKeys />
+      <PartitionKeyType>Hash</PartitionKeyType>
+    </Input>
+    <Output>
+      <PartitionedQueryExecutionInfoInternal>
+        <QueryInfo>
+          <DistinctType>None</DistinctType>
+          <Top />
+          <Offset />
+          <Limit />
+          <GroupByExpressions>
+            <GroupByExpression>c.age</GroupByExpression>
+          </GroupByExpressions>
+          <OrderBy />
+          <OrderByExpressions />
+          <Aggregates>
+            <AggregateOperator>Average</AggregateOperator>
+          </Aggregates>
+          <GroupByAliasToAggregateType />
+          <GroupByAliases />
+          <HasSelectValue>True</HasSelectValue>
+        </QueryInfo>
+        <QueryRanges>
+          <Range>
+            <Range>[[],"Infinity")</Range>
+          </Range>
+        </QueryRanges>
+        <RewrittenQuery><![CDATA[SELECT [{"item": c.age}] AS groupByItems, [{"item": {"sum": SUM(c.age), "count": COUNT(c.age)}}] AS payload
+FROM c
+GROUP BY c.age]]></RewrittenQuery>
+      </PartitionedQueryExecutionInfoInternal>
+    </Output>
+  </Result>
+  <Result>
+    <Input>
+      <Description>SELECT VALUE aggregate COUNT</Description>
+      <Query>
+                SELECT VALUE COUNT(1)
+                FROM c
+                GROUP BY c.age</Query>
+      <PartitionKeys />
+      <PartitionKeyType>Hash</PartitionKeyType>
+    </Input>
+    <Output>
+      <PartitionedQueryExecutionInfoInternal>
+        <QueryInfo>
+          <DistinctType>None</DistinctType>
+          <Top />
+          <Offset />
+          <Limit />
+          <GroupByExpressions>
+            <GroupByExpression>c.age</GroupByExpression>
+          </GroupByExpressions>
+          <OrderBy />
+          <OrderByExpressions />
+          <Aggregates>
+            <AggregateOperator>Count</AggregateOperator>
+          </Aggregates>
+          <GroupByAliasToAggregateType />
+          <GroupByAliases />
+          <HasSelectValue>True</HasSelectValue>
+        </QueryInfo>
+        <QueryRanges>
+          <Range>
+            <Range>[[],"Infinity")</Range>
+          </Range>
+        </QueryRanges>
+        <RewrittenQuery><![CDATA[SELECT [{"item": c.age}] AS groupByItems, [{"item": COUNT(1)}] AS payload
+FROM c
+GROUP BY c.age]]></RewrittenQuery>
+      </PartitionedQueryExecutionInfoInternal>
+    </Output>
+  </Result>
+  <Result>
+    <Input>
       <Description>Simple GROUP BY with no aggregates</Description>
       <Query>
                 SELECT c.age, c.name
@@ -194,14 +321,6 @@ GROUP BY c.age, c.name]]></RewrittenQuery>
           <Aggregates />
           <GroupByAliasToAggregateType>
             <AliasToAggregateType>
-              <Alias>min_age</Alias>
-              <AggregateOperator>Min</AggregateOperator>
-            </AliasToAggregateType>
-            <AliasToAggregateType>
-              <Alias>max_age</Alias>
-              <AggregateOperator>Max</AggregateOperator>
-            </AliasToAggregateType>
-            <AliasToAggregateType>
               <Alias>count</Alias>
               <AggregateOperator>Count</AggregateOperator>
             </AliasToAggregateType>
@@ -212,6 +331,14 @@ GROUP BY c.age, c.name]]></RewrittenQuery>
             <AliasToAggregateType>
               <Alias>team</Alias>
               <AggregateOperator>null</AggregateOperator>
+            </AliasToAggregateType>
+            <AliasToAggregateType>
+              <Alias>min_age</Alias>
+              <AggregateOperator>Min</AggregateOperator>
+            </AliasToAggregateType>
+            <AliasToAggregateType>
+              <Alias>max_age</Alias>
+              <AggregateOperator>Max</AggregateOperator>
             </AliasToAggregateType>
             <AliasToAggregateType>
               <Alias>avg_age</Alias>
@@ -349,7 +476,10 @@ GROUP BY UPPER(c.name), SUBSTRING(c.address.city, 0, 3)]]></RewrittenQuery>
       <PartitionKeyType>Hash</PartitionKeyType>
     </Input>
     <Output>
-      <Exception>TryCatch resulted in an exception.</Exception>
+      <Exception>Microsoft.Azure.Cosmos.Query.Core.Monads.ExceptionWithStackTraceException : TryCatch resulted in an exception.
+Microsoft.Azure.Cosmos.Query.Core.Exceptions.ExpectedQueryPartitionProviderException : {"errors":[{"severity":"Error","location":{"start":32,"end":39},"code":"SC2102","message":"Property reference 's.score' is invalid in the select list because it is not contained in either an aggregate function or the GROUP BY clause."},{"severity":"Error","location":{"start":41,"end":49},"code":"SC2102","message":"Property reference 's.repeat' is invalid in the select list because it is not contained in either an aggregate function or the GROUP BY clause."}]}
+System.Runtime.InteropServices.COMException : 0x800A0B00
+</Exception>
     </Output>
   </Result>
   <Result>
@@ -387,15 +517,15 @@ GROUP BY UPPER(c.name), SUBSTRING(c.address.city, 0, 3)]]></RewrittenQuery>
           <Aggregates />
           <GroupByAliasToAggregateType>
             <AliasToAggregateType>
-              <Alias>group_name</Alias>
-              <AggregateOperator>null</AggregateOperator>
-            </AliasToAggregateType>
-            <AliasToAggregateType>
               <Alias>count</Alias>
               <AggregateOperator>Count</AggregateOperator>
             </AliasToAggregateType>
             <AliasToAggregateType>
               <Alias>info</Alias>
+              <AggregateOperator>null</AggregateOperator>
+            </AliasToAggregateType>
+            <AliasToAggregateType>
+              <Alias>group_name</Alias>
               <AggregateOperator>null</AggregateOperator>
             </AliasToAggregateType>
           </GroupByAliasToAggregateType>
@@ -413,22 +543,22 @@ GROUP BY UPPER(c.name), SUBSTRING(c.address.city, 0, 3)]]></RewrittenQuery>
         </QueryRanges>
         <RewrittenQuery><![CDATA[SELECT [{"item": info}, {"item": g.name}] AS groupByItems, {"info": info, "count": {"item": Count(1)}, "group_name": g.name} AS payload
 FROM c
-JOIN 
-    (SELECT VALUE s
+JOIN (
+    SELECT VALUE s
     FROM s IN c.scores
-    GROUP BY s)
- AS s
-JOIN 
-    (SELECT s1 AS score, Avg(s1) AS avg_score, g1.name AS group_name
+    GROUP BY s
+) AS s
+JOIN (
+    SELECT s1 AS score, Avg(s1) AS avg_score, g1.name AS group_name
     FROM s1 IN c.scores
     JOIN g1 IN c.groups
-    GROUP BY s1, g1)
- AS info
-JOIN 
-    (SELECT VALUE g
+    GROUP BY s1, g1
+) AS info
+JOIN (
+    SELECT VALUE g
     FROM g IN c.groups
-    GROUP BY g)
- AS g
+    GROUP BY g
+) AS g
 WHERE (info.group_name = g.name)
 GROUP BY info, g.name]]></RewrittenQuery>
       </PartitionedQueryExecutionInfoInternal>
@@ -600,16 +730,12 @@ GROUP BY c.name]]></RewrittenQuery>
           <Aggregates />
           <GroupByAliasToAggregateType>
             <AliasToAggregateType>
-              <Alias>max_age</Alias>
-              <AggregateOperator>Max</AggregateOperator>
+              <Alias>count</Alias>
+              <AggregateOperator>Count</AggregateOperator>
             </AliasToAggregateType>
             <AliasToAggregateType>
               <Alias>name</Alias>
               <AggregateOperator>null</AggregateOperator>
-            </AliasToAggregateType>
-            <AliasToAggregateType>
-              <Alias>count</Alias>
-              <AggregateOperator>Count</AggregateOperator>
             </AliasToAggregateType>
             <AliasToAggregateType>
               <Alias>$1</Alias>
@@ -621,6 +747,10 @@ GROUP BY c.name]]></RewrittenQuery>
             </AliasToAggregateType>
             <AliasToAggregateType>
               <Alias>$2</Alias>
+              <AggregateOperator>Max</AggregateOperator>
+            </AliasToAggregateType>
+            <AliasToAggregateType>
+              <Alias>max_age</Alias>
               <AggregateOperator>Max</AggregateOperator>
             </AliasToAggregateType>
             <AliasToAggregateType>

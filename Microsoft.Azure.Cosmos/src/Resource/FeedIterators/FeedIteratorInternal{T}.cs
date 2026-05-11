@@ -6,7 +6,6 @@ namespace Microsoft.Azure.Cosmos
 {
     using System.Threading;
     using System.Threading.Tasks;
-    using Microsoft.Azure.Cosmos.CosmosElements;
     using Microsoft.Azure.Cosmos.Tracing;
 
     /// <summary>
@@ -35,7 +34,5 @@ namespace Microsoft.Azure.Cosmos
         }
 
         public abstract Task<FeedResponse<T>> ReadNextAsync(ITrace trace, CancellationToken cancellationToken);
-
-        public abstract CosmosElement GetCosmosElementContinuationToken();
     }
 }

@@ -31,8 +31,13 @@ namespace Microsoft.Azure.Cosmos
             return Task.FromResult(
                 new List<Documents.Routing.Range<string>>
                 {
-                    Documents.Routing.Range<string>.GetPointRange(
-                        this.PartitionKey.InternalKey.GetEffectivePartitionKeyString(partitionKeyDefinition))
+                    Documents.Routing.PartitionKeyInternal.GetEffectivePartitionKeyRange(
+                        partitionKeyDefinition,
+                        new Documents.Routing.Range<Documents.Routing.PartitionKeyInternal>(
+                            min: this.PartitionKey.InternalKey,
+                            max: this.PartitionKey.InternalKey,
+                            isMinInclusive: true,
+                            isMaxInclusive: true))
                 });
         }
 

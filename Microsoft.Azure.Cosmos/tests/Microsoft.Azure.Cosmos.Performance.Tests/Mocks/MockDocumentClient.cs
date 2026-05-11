@@ -6,7 +6,6 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests
 {
     using System;
     using System.Globalization;
-    using System.Text;
     using System.Threading;
     using System.Threading.Tasks;
     using Microsoft.Azure.Cosmos;
@@ -19,17 +18,20 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests
     using Moq;
     using System.Collections.ObjectModel;
     using System.Collections.Generic;
-    using Microsoft.CodeAnalysis.CSharp.Syntax;
-    using System.IO;
     using Microsoft.Azure.Cosmos.Tracing;
     using Microsoft.Azure.Cosmos.Query.Core.QueryPlan;
     using Newtonsoft.Json;
+    using Microsoft.Azure.Cosmos.Telemetry;
+    using System.Net.Http;
+    using System.Net;
+    using System.Text;
 
     internal class MockDocumentClient : DocumentClient, ICosmosAuthorizationTokenProvider
     {
         Mock<ClientCollectionCache> collectionCache;
         Mock<PartitionKeyRangeCache> partitionKeyRangeCache;
         Mock<GlobalEndpointManager> globalEndpointManager;
+
         private static readonly PartitionKeyDefinition partitionKeyDefinition = new PartitionKeyDefinition()
         {
             Kind = PartitionKind.Hash,
@@ -40,16 +42,18 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests
         };
 
         string[] dummyHeaderNames;
-        private IComputeHash authKeyHashFunction;
+        private readonly IComputeHash authKeyHashFunction;
 
         public static CosmosClient CreateMockCosmosClient(
             bool useCustomSerializer = false,
-            bool? isClientTelemetryEnabled = null,
             Action < CosmosClientBuilder> customizeClientBuilder = null)
         {
-            MockDocumentClient documentClient = new MockDocumentClient();
+            MockDocumentClient documentClient = new MockDocumentClient(new ConnectionPolicy());
             CosmosClientBuilder cosmosClientBuilder = new CosmosClientBuilder("http://localhost", Convert.ToBase64String(Guid.NewGuid().ToByteArray()));
             cosmosClientBuilder.WithConnectionModeDirect();
+
+            Uri telemetryServiceEndpoint = new Uri("https://dummy.endpoint.com/");
+
             customizeClientBuilder?.Invoke(cosmosClientBuilder);
 
             if (useCustomSerializer)
@@ -59,11 +63,6 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests
                     {
                         IgnoreNullValues = true,
                     });
-            }
-
-            if (isClientTelemetryEnabled.HasValue && isClientTelemetryEnabled.Value)
-            {
-                cosmosClientBuilder.WithTelemetryEnabled();
             }
 
             documentClient.dummyHeaderNames = new string[100];
@@ -79,8 +78,8 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests
             return cosmosClientBuilder.Build(documentClient);
         }
 
-        public MockDocumentClient()
-            : base(new Uri("http://localhost"), null)
+        public MockDocumentClient(ConnectionPolicy policy = null)
+            : base(new Uri("http://localhost"), connectionPolicy: policy)
         {
             this.authKeyHashFunction = new StringHMACSHA256Hash(MockDocumentClient.GenerateRandomKey());
 
@@ -114,7 +113,8 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests
         internal override IRetryPolicyFactory ResetSessionTokenRetryPolicy => new RetryPolicy(
             this.globalEndpointManager.Object,
             new ConnectionPolicy(), 
-            new GlobalPartitionEndpointManagerCore(this.globalEndpointManager.Object));
+            new GlobalPartitionEndpointManagerCore(this.globalEndpointManager.Object),
+            false);
 
         internal override Task<ClientCollectionCache> GetCollectionCacheAsync(ITrace trace)
         {
@@ -153,7 +153,7 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests
 
         private void Init()
         {
-            this.collectionCache = new Mock<ClientCollectionCache>(null, new ServerStoreModel(null), null, null, null);
+            this.collectionCache = new Mock<ClientCollectionCache>(null, new ServerStoreModel(null), null, null, null, false);
 
             ContainerProperties containerProperties = ContainerProperties.CreateWithResourceId("test");
             containerProperties.PartitionKey = partitionKeyDefinition;
@@ -180,9 +180,9 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests
                     {
                         Tuple.Create(new PartitionKeyRange{ Id = "0", MinInclusive = "", MaxExclusive = "FF"}, (ServiceIdentity)null)
                     },
-                string.Empty);
+                string.Empty, false);
 
-            this.partitionKeyRangeCache = new Mock<PartitionKeyRangeCache>(null, null, null);
+            this.partitionKeyRangeCache = new Mock<PartitionKeyRangeCache>(null, null, null, null, false, false);
             this.partitionKeyRangeCache.Setup(
                         m => m.TryLookupAsync(
                             It.IsAny<string>(),
@@ -210,8 +210,15 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests
                     It.IsAny<bool>()))
                 .Returns(Task.FromResult((IReadOnlyList<PartitionKeyRange>)result));
 
-            this.globalEndpointManager = new Mock<GlobalEndpointManager>(this, new ConnectionPolicy());
+            this.globalEndpointManager = new Mock<GlobalEndpointManager>(this, new ConnectionPolicy(), false);
 
+            this.telemetryToServiceHelper = TelemetryToServiceHelper.CreateAndInitializeClientConfigAndTelemetryJob("perf-test-client",
+                                                                this.ConnectionPolicy,
+                                                                new Mock<AuthorizationTokenProvider>().Object,
+                                                                new Mock<CosmosHttpClient>().Object,
+                                                                this.ServiceEndpoint,
+                                                                this.GlobalEndpointManager,
+                                                                default);
             this.InitStoreModels();
         }
 
@@ -242,7 +249,7 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests
                         mockServiceConfigReader.Object,
                         mockAuthorizationTokenProvider.Object,
                         Protocol.Tcp,
-                        this.GetMockTransportClient(addressInformation),
+                        this.GetMockTransportClient(),
                         enableRequestDiagnostics: true));
         }
 
@@ -281,7 +288,7 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests
             return addressInformation;
         }
 
-        private TransportClient GetMockTransportClient(AddressInformation[] addressInformation)
+        private TransportClient GetMockTransportClient()
         {
             Mock<TransportClient> mockTransportClient = new Mock<TransportClient>();
 
@@ -301,6 +308,11 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests
                 _ = dsr.Headers[this.dummyHeaderNames[i]];
             }
 
+            if (ConfigurationManager.IsBinaryEncodingEnabled() && IsPointOperationSupportedForBinaryEncoding(dsr))
+            {
+                dsr.Headers[HttpConstants.HttpHeaders.SupportedSerializationFormats] = SupportedSerializationFormats.CosmosBinary.ToString();
+            }
+
             return true;
         }
 
@@ -315,6 +327,16 @@ namespace Microsoft.Azure.Cosmos.Performance.Tests
                         Task.FromResult(MockRequestHelper.GetDocumentServiceResponse(documentServiceRequest)));
 
             return gatewayStoreModel.Object;
+        }
+
+        private static bool IsPointOperationSupportedForBinaryEncoding(DocumentServiceRequest request)
+        {
+            return request.ResourceType == ResourceType.Document
+                && (request.OperationType == OperationType.Create
+                    || request.OperationType == OperationType.Replace
+                    || request.OperationType == OperationType.Delete
+                    || request.OperationType == OperationType.Read
+                    || request.OperationType == OperationType.Upsert);
         }
     }
 }

@@ -14,44 +14,64 @@ Copyright (C) Microsoft Corporation. All rights reserved.
 -->
 <Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
     
-  <ItemGroup>
+  <!-- Only include Windows native DLLs when:
+       1. RuntimeIdentifier is empty (regular build without RID), OR
+       2. RuntimeIdentifier is specified AND starts with 'win'
+       
+       Note: The 'win' prefix filter is used for backward compatibility and may copy
+       DLLs for win-x86, win-x64, win-arm, win-arm64, etc. and ServiceInteropWrapper
+	   will attempt to load the correct one based on the actual architecture of the 
+	   machine at runtime. 
+	   
+	    Currently on win-x64 only, but this allows for future expansion for win-arm64.
+  -->
+  <ItemGroup Condition="'$(RuntimeIdentifier)' == '' OR $(RuntimeIdentifier.StartsWith('win'))">
     <ContentWithTargetPath Include="$(MSBuildThisFileDirectory)..\..\runtimes\win-x64\native\Microsoft.Azure.Cosmos.ServiceInterop.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <TargetPath>Microsoft.Azure.Cosmos.ServiceInterop.dll</TargetPath>
       <Visible>False</Visible>
     </ContentWithTargetPath>
-  </ItemGroup>
-  
-  <ItemGroup>
     <ContentWithTargetPath Include="$(MSBuildThisFileDirectory)..\..\runtimes\win-x64\native\Cosmos.CRTCompat.dll">
       <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
       <TargetPath>Cosmos.CRTCompat.dll</TargetPath>
       <Visible>False</Visible>
     </ContentWithTargetPath>
-  </ItemGroup>
-
-  <ItemGroup>
       <ContentWithTargetPath Include="$(MSBuildThisFileDirectory)..\..\runtimes\win-x64\native\msvcp140.dll">
           <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
           <TargetPath>msvcp140.dll</TargetPath>
           <Visible>False</Visible>
       </ContentWithTargetPath>
-  </ItemGroup>
-
-  <ItemGroup>
       <ContentWithTargetPath Include="$(MSBuildThisFileDirectory)..\..\runtimes\win-x64\native\vcruntime140.dll">
           <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
           <TargetPath>vcruntime140.dll</TargetPath>
           <Visible>False</Visible>
       </ContentWithTargetPath>
-  </ItemGroup>
-
-  <ItemGroup>
       <ContentWithTargetPath Include="$(MSBuildThisFileDirectory)..\..\runtimes\win-x64\native\vcruntime140_1.dll">
           <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
           <TargetPath>vcruntime140_1.dll</TargetPath>
           <Visible>False</Visible>
       </ContentWithTargetPath>
   </ItemGroup>
-    
+
+
+  <!-- Add check for Newtonsoft.Json package in consumer app.  -->
+    <Target Name="CheckNewtonsoftJsonPresence" AfterTargets="ResolveAssemblyReferences"
+        Condition="'$(ExcludeRestorePackageImports)' != 'true' AND '$(AzureCosmosDisableNewtonsoftJsonCheck)' != 'true'">
+        
+        <!-- Check for PackageReference to Newtonsoft.Json -->
+        <ItemGroup>
+            <NewtonsoftJsonPackageReference Include="@(PackageReference)" Condition="'%(PackageReference.Identity)' == 'Newtonsoft.Json'" />
+        </ItemGroup>
+        
+        <!-- Check for assembly references to Newtonsoft.Json (including transitive dependencies) -->
+        <ItemGroup>
+            <NewtonsoftJsonAssemblyReference Include="@(ReferencePath)" Condition="'%(FileName)' == 'Newtonsoft.Json'" />
+        </ItemGroup>
+        
+        <!-- Produce an error if Newtonsoft.Json is not found -->
+        <Error Text="The Newtonsoft.Json package must be explicitly referenced with version >= 10.0.2. Please add a reference to Newtonsoft.Json or set the 'AzureCosmosDisableNewtonsoftJsonCheck' property to 'true' to bypass this check."
+            Condition="'@(NewtonsoftJsonPackageReference)' == '' AND '@(NewtonsoftJsonAssemblyReference)' == ''" />
+
+    </Target>
+
 </Project>

@@ -10,7 +10,11 @@ namespace Microsoft.Azure.Cosmos.Tests
     using System.Linq;
     using System.Net;
     using System.Net.Http;
-    using Cosmos.Telemetry;
+    using System.Net.Security;
+    using System.Reflection;
+    using System.Security.Cryptography;
+    using System.Security.Cryptography.X509Certificates;
+    using System.Text;
     using global::Azure.Core;
     using Microsoft.Azure.Cosmos.Fluent;
     using Microsoft.Azure.Documents;
@@ -22,7 +26,7 @@ namespace Microsoft.Azure.Cosmos.Tests
     public class CosmosClientOptionsUnitTests
     {
         public const string AccountEndpoint = "https://localhost:8081/";
-        public const string ConnectionString = "AccountEndpoint=https://localtestcosmos.documents.azure.com:443/;AccountKey=425Mcv8CXQqzRNCgFNjIhT424GK99CKJvASowTnq15Vt8LeahXTcN5wt3342vQ==;";
+        public const string ConnectionString = "AccountEndpoint=https://example.documents.azure.com:443/;AccountKey=NotRealKey==;";
         public Func<HttpClient> HttpClientFactoryDelegate = () => new HttpClient();
 
         [TestMethod]
@@ -52,11 +56,13 @@ namespace Microsoft.Azure.Cosmos.Tests
             Cosmos.PortReuseMode portReuseMode = Cosmos.PortReuseMode.PrivatePortPool;
             IWebProxy webProxy = new TestWebProxy();
             Cosmos.ConsistencyLevel consistencyLevel = Cosmos.ConsistencyLevel.ConsistentPrefix;
+            Cosmos.PriorityLevel priorityLevel = Cosmos.PriorityLevel.Low;
+            int throughputBucket = 3;
 
             CosmosClientBuilder cosmosClientBuilder = new CosmosClientBuilder(
                 accountEndpoint: endpoint,
                 authKeyOrResourceToken: key);
-            
+
             CosmosClient cosmosClient = cosmosClientBuilder.Build(new MockDocumentClient());
             CosmosClientOptions clientOptions = cosmosClient.ClientOptions;
 
@@ -80,7 +86,11 @@ namespace Microsoft.Azure.Cosmos.Tests
             Assert.IsTrue(clientOptions.EnableTcpConnectionEndpointRediscovery);
             Assert.IsNull(clientOptions.HttpClientFactory);
             Assert.AreNotEqual(consistencyLevel, clientOptions.ConsistencyLevel);
-            Assert.IsFalse(clientOptions.EnablePartitionLevelFailover);
+            Assert.IsNull(clientOptions.ReadConsistencyStrategy);
+            Assert.AreNotEqual(priorityLevel, clientOptions.PriorityLevel);
+            Assert.IsFalse(clientOptions.EnablePartitionLevelCircuitBreaker);
+            Assert.IsFalse(clientOptions.EnableAdvancedReplicaSelectionForTcp.HasValue);
+            Assert.AreNotEqual(throughputBucket, clientOptions.ThroughputBucket);
 
             //Verify GetConnectionPolicy returns the correct values for default
             ConnectionPolicy policy = clientOptions.GetConnectionPolicy(clientId: 0);
@@ -97,6 +107,13 @@ namespace Microsoft.Azure.Cosmos.Tests
             Assert.IsNull(policy.HttpClientFactory);
             Assert.AreNotEqual(Cosmos.ConsistencyLevel.Session, clientOptions.ConsistencyLevel);
             Assert.IsFalse(policy.EnablePartitionLevelFailover);
+            Assert.IsFalse(clientOptions.EnableAdvancedReplicaSelectionForTcp.HasValue);
+#if PREVIEW
+            Assert.IsFalse(clientOptions.CosmosClientTelemetryOptions.DisableDistributedTracing);
+#else
+            Assert.IsTrue(clientOptions.CosmosClientTelemetryOptions.DisableDistributedTracing);
+#endif
+            Assert.IsTrue(clientOptions.CosmosClientTelemetryOptions.DisableSendingMetricsToService);
 
             cosmosClientBuilder.WithApplicationRegion(region)
                 .WithConnectionModeGateway(maxConnections, webProxy)
@@ -108,10 +125,12 @@ namespace Microsoft.Azure.Cosmos.Tests
                 .WithBulkExecution(true)
                 .WithSerializerOptions(cosmosSerializerOptions)
                 .WithConsistencyLevel(consistencyLevel)
-                .WithPartitionLevelFailoverEnabled();
+                .WithPriorityLevel(priorityLevel)
+                .WithThroughputBucket(throughputBucket);
 
             cosmosClient = cosmosClientBuilder.Build(new MockDocumentClient());
             clientOptions = cosmosClient.ClientOptions;
+            clientOptions.EnableAdvancedReplicaSelectionForTcp = true;
 
             //Verify all the values are updated
             Assert.AreEqual(region, clientOptions.ApplicationRegion);
@@ -130,7 +149,11 @@ namespace Microsoft.Azure.Cosmos.Tests
             Assert.IsTrue(object.ReferenceEquals(webProxy, clientOptions.WebProxy));
             Assert.IsTrue(clientOptions.AllowBulkExecution);
             Assert.AreEqual(consistencyLevel, clientOptions.ConsistencyLevel);
-            Assert.IsTrue(clientOptions.EnablePartitionLevelFailover);
+            Assert.IsNull(clientOptions.ReadConsistencyStrategy);
+            Assert.AreEqual(priorityLevel, clientOptions.PriorityLevel);
+            Assert.IsFalse(clientOptions.EnablePartitionLevelCircuitBreaker);
+            Assert.IsTrue(clientOptions.EnableAdvancedReplicaSelectionForTcp.HasValue && clientOptions.EnableAdvancedReplicaSelectionForTcp.Value);
+            Assert.AreEqual(throughputBucket, clientOptions.ThroughputBucket);
 
             //Verify GetConnectionPolicy returns the correct values
             policy = clientOptions.GetConnectionPolicy(clientId: 0);
@@ -144,9 +167,16 @@ namespace Microsoft.Azure.Cosmos.Tests
             Assert.AreEqual(maxRetryAttemptsOnThrottledRequests, policy.RetryOptions.MaxRetryAttemptsOnThrottledRequests);
             Assert.AreEqual((int)maxRetryWaitTime.TotalSeconds, policy.RetryOptions.MaxRetryWaitTimeInSeconds);
             Assert.AreEqual((Documents.ConsistencyLevel)consistencyLevel, clientOptions.GetDocumentsConsistencyLevel());
-            Assert.IsTrue(policy.EnablePartitionLevelFailover);
-            
+            Assert.IsFalse(policy.EnablePartitionLevelFailover);
+            Assert.IsTrue(clientOptions.EnableAdvancedReplicaSelectionForTcp.Value);
+
             IReadOnlyList<string> preferredLocations = new List<string>() { Regions.AustraliaCentral, Regions.AustraliaCentral2 };
+            ISet<Uri> regionalEndpoints = new HashSet<Uri>()
+            {
+                new Uri("https://testfed2.documents-test.windows-int.net:443/"),
+                new Uri("https://testfed4.documents-test.windows-int.net:443/")
+            };
+
             //Verify Direct Mode settings
             cosmosClientBuilder = new CosmosClientBuilder(
                 accountEndpoint: endpoint,
@@ -159,9 +189,15 @@ namespace Microsoft.Azure.Cosmos.Tests
                 portReuseMode,
                 enableTcpConnectionEndpointRediscovery)
                 .WithApplicationPreferredRegions(preferredLocations)
-                .WithDistributedTracingOptions(new DistributedTracingOptions
+                .WithCustomAccountEndpoints(regionalEndpoints)
+                .WithClientTelemetryOptions(new CosmosClientTelemetryOptions()
                 {
-                    LatencyThresholdForDiagnosticEvent = TimeSpan.FromMilliseconds(100)
+                    DisableDistributedTracing = false,
+                    CosmosThresholdOptions = new CosmosThresholdOptions()
+                    {
+                        PointOperationLatencyThreshold = TimeSpan.FromMilliseconds(100),
+                        NonPointOperationLatencyThreshold = TimeSpan.FromMilliseconds(100)
+                    }
                 });
 
             cosmosClient = cosmosClientBuilder.Build(new MockDocumentClient());
@@ -174,8 +210,10 @@ namespace Microsoft.Azure.Cosmos.Tests
             Assert.AreEqual(portReuseMode, clientOptions.PortReuseMode);
             Assert.IsTrue(clientOptions.EnableTcpConnectionEndpointRediscovery);
             CollectionAssert.AreEqual(preferredLocations.ToArray(), clientOptions.ApplicationPreferredRegions.ToArray());
-            Assert.AreEqual(TimeSpan.FromMilliseconds(100), clientOptions.DistributedTracingOptions.LatencyThresholdForDiagnosticEvent);
-            Assert.IsTrue(clientOptions.IsDistributedTracingEnabled);
+            CollectionAssert.AreEqual(regionalEndpoints.ToArray(), clientOptions.AccountInitializationCustomEndpoints.ToArray());
+            Assert.AreEqual(TimeSpan.FromMilliseconds(100), clientOptions.CosmosClientTelemetryOptions.CosmosThresholdOptions.PointOperationLatencyThreshold);
+            Assert.AreEqual(TimeSpan.FromMilliseconds(100), clientOptions.CosmosClientTelemetryOptions.CosmosThresholdOptions.NonPointOperationLatencyThreshold);
+            Assert.IsFalse(clientOptions.CosmosClientTelemetryOptions.DisableDistributedTracing);
 
             //Verify GetConnectionPolicy returns the correct values
             policy = clientOptions.GetConnectionPolicy(clientId: 0);
@@ -186,6 +224,197 @@ namespace Microsoft.Azure.Cosmos.Tests
             Assert.AreEqual(portReuseMode, policy.PortReuseMode);
             Assert.IsTrue(policy.EnableTcpConnectionEndpointRediscovery);
             CollectionAssert.AreEqual(preferredLocations.ToArray(), policy.PreferredLocations.ToArray());
+            CollectionAssert.AreEqual(regionalEndpoints.ToArray(), policy.AccountInitializationCustomEndpoints.ToArray());
+        }
+
+        [TestMethod]
+        public void VerifyReadConsistencyStrategyBuilderProperties()
+        {
+            string endpoint = AccountEndpoint;
+            string key = MockCosmosUtil.RandomInvalidCorrectlyFormatedAuthKey;
+
+            // Verify default is null
+            CosmosClientBuilder cosmosClientBuilder = new CosmosClientBuilder(
+                accountEndpoint: endpoint,
+                authKeyOrResourceToken: key);
+
+            CosmosClient cosmosClient = cosmosClientBuilder.Build(new MockDocumentClient());
+            CosmosClientOptions clientOptions = cosmosClient.ClientOptions;
+
+            Assert.IsNull(clientOptions.ReadConsistencyStrategy);
+            Assert.IsNull(clientOptions.ConsistencyLevel);
+
+            // Verify WithReadConsistencyStrategy sets the property and does not affect ConsistencyLevel
+            cosmosClientBuilder = new CosmosClientBuilder(
+                accountEndpoint: endpoint,
+                authKeyOrResourceToken: key);
+
+            cosmosClientBuilder
+                .WithReadConsistencyStrategy(Cosmos.ReadConsistencyStrategy.LatestCommitted);
+
+            cosmosClient = cosmosClientBuilder.Build(new MockDocumentClient());
+            clientOptions = cosmosClient.ClientOptions;
+
+            Assert.AreEqual(Cosmos.ReadConsistencyStrategy.LatestCommitted, clientOptions.ReadConsistencyStrategy);
+            Assert.IsNull(clientOptions.ConsistencyLevel);
+            Assert.IsNull(clientOptions.GetDocumentsConsistencyLevel());
+
+            // Verify each enum value round-trips through the builder
+            foreach (Cosmos.ReadConsistencyStrategy strategy in Enum.GetValues(typeof(Cosmos.ReadConsistencyStrategy)))
+            {
+                cosmosClientBuilder = new CosmosClientBuilder(
+                    accountEndpoint: endpoint,
+                    authKeyOrResourceToken: key);
+
+                cosmosClientBuilder.WithReadConsistencyStrategy(strategy);
+
+                cosmosClient = cosmosClientBuilder.Build(new MockDocumentClient());
+                clientOptions = cosmosClient.ClientOptions;
+
+                Assert.AreEqual(strategy, clientOptions.ReadConsistencyStrategy,
+                    $"ReadConsistencyStrategy {strategy} did not round-trip through builder");
+                Assert.IsNull(clientOptions.ConsistencyLevel,
+                    $"ConsistencyLevel should remain null when ReadConsistencyStrategy is set to {strategy}");
+            }
+        }
+
+        /// <summary>
+        /// Test to validate that when the partition level failover is enabled with the preferred regions list is missing, then the client
+        /// initialization should succeed. This should hold true for both environment variable and CosmosClientOptions.
+        /// </summary>
+        [TestMethod]
+        [Owner("dkunda")]
+        public void CosmosClientOptions_WhenPartitionLevelFailoverEnabledAndPreferredRegionsNotSet_ShouldInitializeCosmosClientSuccessfully()
+        {
+            try
+            {
+                Environment.SetEnvironmentVariable(ConfigurationManager.PartitionLevelFailoverEnabled, "True");
+
+                string endpoint = AccountEndpoint;
+                string key = MockCosmosUtil.RandomInvalidCorrectlyFormatedAuthKey;
+                TimeSpan requestTimeout = TimeSpan.FromDays(1);
+                string userAgentSuffix = "testSuffix";
+                RequestHandler preProcessHandler = new TestHandler();
+                ApiType apiType = ApiType.Sql;
+                int maxRetryAttemptsOnThrottledRequests = 9999;
+                TimeSpan maxRetryWaitTime = TimeSpan.FromHours(6);
+                CosmosSerializationOptions cosmosSerializerOptions = new CosmosSerializationOptions()
+                {
+                    IgnoreNullValues = true,
+                    PropertyNamingPolicy = CosmosPropertyNamingPolicy.CamelCase,
+                };
+
+                Cosmos.ConsistencyLevel consistencyLevel = Cosmos.ConsistencyLevel.ConsistentPrefix;
+                Cosmos.PriorityLevel priorityLevel = Cosmos.PriorityLevel.Low;
+                int throughputBucket = 3;
+
+                CosmosClientBuilder cosmosClientBuilder = new(
+                    accountEndpoint: endpoint,
+                    authKeyOrResourceToken: key);
+
+                cosmosClientBuilder
+                    .WithConnectionModeDirect()
+                    .WithRequestTimeout(requestTimeout)
+                    .WithApplicationName(userAgentSuffix)
+                    .AddCustomHandlers(preProcessHandler)
+                    .WithApiType(apiType)
+                    .WithThrottlingRetryOptions(maxRetryWaitTime, maxRetryAttemptsOnThrottledRequests)
+                    .WithSerializerOptions(cosmosSerializerOptions)
+                    .WithConsistencyLevel(consistencyLevel)
+                    .WithPriorityLevel(priorityLevel)
+                    .WithThroughputBucket(throughputBucket);
+
+                CosmosClient cosmosClient = cosmosClientBuilder.Build();
+
+                Assert.IsNotNull(cosmosClient,
+                    message: "ApplicationPreferredRegions or ApplicationRegion is no longer mandatory fields, hence the client initialization should succeed.");
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable(ConfigurationManager.PartitionLevelFailoverEnabled, null);
+            }
+        }
+
+        /// <summary>
+        /// Test to validate that when the partition level failover is enabled with the preferred regions list is provided, then the client
+        /// initialization should be successful. This holds true for both environment variable and CosmosClientOptions.
+        /// </summary>
+        [TestMethod]
+        [Owner("dkunda")]
+        public void CosmosClientOptions_WhenPartitionLevelFailoverEnabledAndPreferredRegionsSet_ShouldInitializeSuccessfully()
+        {
+            try
+            {
+                Environment.SetEnvironmentVariable(ConfigurationManager.PartitionLevelFailoverEnabled, "True");
+
+                string endpoint = AccountEndpoint;
+                string key = MockCosmosUtil.RandomInvalidCorrectlyFormatedAuthKey;
+                TimeSpan requestTimeout = TimeSpan.FromDays(1);
+                string userAgentSuffix = "testSuffix";
+                RequestHandler preProcessHandler = new TestHandler();
+                ApiType apiType = ApiType.Sql;
+                int maxRetryAttemptsOnThrottledRequests = 9999;
+                TimeSpan maxRetryWaitTime = TimeSpan.FromHours(6);
+                CosmosSerializationOptions cosmosSerializerOptions = new CosmosSerializationOptions()
+                {
+                    IgnoreNullValues = true,
+                    PropertyNamingPolicy = CosmosPropertyNamingPolicy.CamelCase,
+                };
+
+                Cosmos.ConsistencyLevel consistencyLevel = Cosmos.ConsistencyLevel.ConsistentPrefix;
+                Cosmos.PriorityLevel priorityLevel = Cosmos.PriorityLevel.Low;
+                int throughputBucket = 3;
+                CosmosClientBuilder cosmosClientBuilder = new(
+                    accountEndpoint: endpoint,
+                    authKeyOrResourceToken: key);
+
+                cosmosClientBuilder
+                    .WithConnectionModeDirect()
+                    .WithRequestTimeout(requestTimeout)
+                    .WithApplicationName(userAgentSuffix)
+                    .AddCustomHandlers(preProcessHandler)
+                    .WithApiType(apiType)
+                    .WithThrottlingRetryOptions(maxRetryWaitTime, maxRetryAttemptsOnThrottledRequests)
+                    .WithSerializerOptions(cosmosSerializerOptions)
+                    .WithConsistencyLevel(consistencyLevel)
+                    .WithPriorityLevel(priorityLevel)
+                    .WithThroughputBucket(throughputBucket)
+                    .WithApplicationPreferredRegions(
+                        new List<string>()
+                        {
+                        Regions.NorthCentralUS,
+                        Regions.WestUS,
+                        Regions.EastAsia,
+                        })
+                    .WithCustomAccountEndpoints(
+                        new HashSet<Uri>()
+                        {
+                        new Uri("https://testfed2.documents-test.windows-int.net:443/"),
+                        new Uri("https://testfed3.documents-test.windows-int.net:443/"),
+                        new Uri("https://testfed4.documents-test.windows-int.net:443/"),
+                        });
+
+                CosmosClientOptions clientOptions = cosmosClientBuilder.Build().ClientOptions;
+
+                Assert.AreEqual(ConnectionMode.Direct, clientOptions.ConnectionMode);
+                Assert.AreEqual(requestTimeout, clientOptions.RequestTimeout);
+                Assert.AreEqual(userAgentSuffix, clientOptions.ApplicationName);
+                Assert.AreEqual(preProcessHandler, clientOptions.CustomHandlers[0]);
+                Assert.AreEqual(apiType, clientOptions.ApiType);
+                Assert.AreEqual(maxRetryAttemptsOnThrottledRequests, clientOptions.MaxRetryAttemptsOnRateLimitedRequests);
+                Assert.AreEqual(maxRetryWaitTime, clientOptions.MaxRetryWaitTimeOnRateLimitedRequests);
+                Assert.AreEqual(cosmosSerializerOptions.IgnoreNullValues, clientOptions.SerializerOptions.IgnoreNullValues);
+                Assert.AreEqual(cosmosSerializerOptions.PropertyNamingPolicy, clientOptions.SerializerOptions.PropertyNamingPolicy);
+                Assert.AreEqual(cosmosSerializerOptions.Indented, clientOptions.SerializerOptions.Indented);
+                Assert.IsFalse(clientOptions.AllowBulkExecution);
+                Assert.AreEqual(consistencyLevel, clientOptions.ConsistencyLevel);
+                Assert.IsNotNull(clientOptions.ApplicationPreferredRegions);
+                Assert.IsNotNull(clientOptions.AccountInitializationCustomEndpoints);
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable(ConfigurationManager.PartitionLevelFailoverEnabled, null);
+            }
         }
 
         [TestMethod]
@@ -212,6 +441,54 @@ namespace Microsoft.Azure.Cosmos.Tests
             };
 
             Assert.IsNull(cosmosClientOptionsNull.GetDocumentsConsistencyLevel());
+        }
+
+        [TestMethod]
+        public void VerifyPriorityLevels()
+        {
+            List<Cosmos.PriorityLevel> cosmosLevels = Enum.GetValues(typeof(Cosmos.PriorityLevel)).Cast<Cosmos.PriorityLevel>().ToList();
+            List<Documents.PriorityLevel> documentLevels = Enum.GetValues(typeof(Documents.PriorityLevel)).Cast<Documents.PriorityLevel>().ToList();
+            CollectionAssert.AreEqual(cosmosLevels, documentLevels, new EnumComparer(), "Document priority level is different from cosmos priority level");
+
+            foreach (Cosmos.PriorityLevel priorityLevel in cosmosLevels)
+            {
+                CosmosClientOptions cosmosClientOptions = new CosmosClientOptions()
+                {
+                    PriorityLevel = priorityLevel
+                };
+
+                Assert.AreEqual(priorityLevel, cosmosClientOptions.PriorityLevel);
+            }
+
+            CosmosClientOptions cosmosClientOptionsNull = new CosmosClientOptions()
+            {
+                PriorityLevel = null
+            };
+
+            Assert.IsNull(cosmosClientOptionsNull.PriorityLevel);
+        }
+
+        [TestMethod]
+        public void VerifyThroughputBuckets()
+        {
+            List<int> throughputBuckets = Enumerable.Range(1, 5).ToList();
+
+            foreach (int throughputBucket in throughputBuckets)
+            {
+                CosmosClientOptions cosmosClientOptions = new CosmosClientOptions()
+                {
+                    ThroughputBucket = throughputBucket
+                };
+
+                Assert.AreEqual(throughputBucket, cosmosClientOptions.ThroughputBucket);
+            }
+
+            CosmosClientOptions cosmosClientOptionsNull = new CosmosClientOptions()
+            {
+                ThroughputBucket = null
+            };
+
+            Assert.IsNull(cosmosClientOptionsNull.ThroughputBucket);
         }
 
         [TestMethod]
@@ -269,27 +546,220 @@ namespace Microsoft.Azure.Cosmos.Tests
         }
 
         [TestMethod]
-        [ExpectedException(typeof(ArgumentException))]
-        public void ThrowOnSerializerOptionsWithCustomSerializer()
+        [Owner("ntripician")]
+        [DataRow(true, false, true, false, false, "F2", DisplayName = "With PPCB and ApplicationName")]
+        [DataRow(true, true, true, false, false, "F3", DisplayName = "With PPAF and ApplicationName")]
+        [DataRow(false, false, true, false, false, "F2", DisplayName = "With PPCB and Without ApplicationName")]
+        [DataRow(true, false, false, false, true, "F4", DisplayName = "With Thin Client and ApplicationName")]
+        [DataRow(true, false, false, true, false, "F8", DisplayName = "With Binary Encoding and ApplicationName")]
+        [DataRow(true, false, false, true, true, "FC", DisplayName = "With Thin Client, Binary Encoding and ApplicationName")]
+        [DataRow(true, false, true, true, true, "FE", DisplayName = "With PPCB, Thin Client, Binary Encoding and ApplicationName")]
+        [DataRow(true, true, true, true, true, "FF", DisplayName = "With PPAF, PPCB, Thin Client, Binary Encoding and ApplicationName")]
+        [DataRow(false, false, false, false, false, "", DisplayName = "Without Any Features and ApplicationName")]
+        public void UserAgentContainsPPAFInformation(
+            bool appName,
+            bool ppaf, 
+            bool ppcb,
+            bool binaryEncoding,
+            bool thinClient,
+            string expectedHexStringPostFix)
+        {
+            try
+            {
+                if (binaryEncoding)
+                {
+                    Environment.SetEnvironmentVariable(ConfigurationManager.BinaryEncodingEnabled, "True");
+                }
+
+                if (thinClient)
+                {
+                    Environment.SetEnvironmentVariable(ConfigurationManager.ThinClientModeEnabled, "True");
+                }
+
+                EnvironmentInformation environmentInformation = new EnvironmentInformation();
+                string expectedValue = "cosmos-netstandard-sdk/" + environmentInformation.ClientVersion;
+                string userAgentSuffix = "testSuffix";
+
+                string endpoint = AccountEndpoint;
+                string key = MockCosmosUtil.RandomInvalidCorrectlyFormatedAuthKey;
+
+                CosmosClientBuilder cosmosClientBuilder = new CosmosClientBuilder(
+                    accountEndpoint: endpoint,
+                    authKeyOrResourceToken: key);
+
+                if (appName)
+                {
+                    cosmosClientBuilder.WithApplicationName(userAgentSuffix);
+                }
+
+                ConnectionPolicy policy = new ConnectionPolicy()
+                {
+                    EnablePartitionLevelCircuitBreaker = ppcb,
+                    EnablePartitionLevelFailover = ppaf
+                };
+
+                CosmosClient cosmosClient = cosmosClientBuilder.Build(new MockDocumentClient(policy, thinClient));
+
+                CosmosClientOptions cosmosClientOptions = cosmosClient.ClientOptions;
+
+                if (appName)
+                {
+                    Assert.AreEqual(userAgentSuffix, cosmosClientOptions.ApplicationName);
+                    cosmosClient.DocumentClient.ConnectionPolicy.UserAgentContainer.AppendFeatures(cosmosClientOptions.ApplicationName);
+                }
+                else
+                {
+                    Assert.IsNull(cosmosClientOptions.ApplicationName);
+                }
+
+                cosmosClient.DocumentClient.ConnectionPolicy.UserAgentContainer.AppendFeatures(cosmosClient.DocumentClient.GetUserAgentFeatures());
+
+                string userAgent = cosmosClient.DocumentClient.ConnectionPolicy.UserAgentContainer.UserAgent;
+                Console.WriteLine(userAgent);
+                if (appName)
+                {
+                    Assert.IsTrue(userAgent.EndsWith(userAgentSuffix));
+                }
+                else
+                {
+                    Assert.IsTrue(userAgent.EndsWith(expectedHexStringPostFix));
+                }
+
+                Assert.IsTrue(userAgent.StartsWith(expectedValue));
+                Assert.IsTrue(userAgent.Contains(expectedHexStringPostFix));
+
+                if (appName)
+                {
+                    Assert.IsTrue(userAgent.EndsWith(userAgentSuffix));
+                }
+                else
+                {
+                    Assert.IsTrue(userAgent.EndsWith(expectedHexStringPostFix));
+                }
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable(ConfigurationManager.BinaryEncodingEnabled, null);
+                Environment.SetEnvironmentVariable(ConfigurationManager.ThinClientModeEnabled, null);
+            }
+        }
+
+        [TestMethod]
+        public void ValidateThatCustomSerializerGetsOverriddenWhenSTJSerializerEnabled()
         {
             CosmosClientOptions options = new CosmosClientOptions()
             {
-                Serializer = new CosmosJsonDotNetSerializer()
+                UseSystemTextJsonSerializerWithOptions = new System.Text.Json.JsonSerializerOptions()
+                {
+                    PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase,
+                }
             };
 
-            options.SerializerOptions = new CosmosSerializationOptions();
+            CosmosClient client = new(
+                "https://fake-account.documents.azure.com:443/",
+                Convert.ToBase64String(Encoding.UTF8.GetBytes(Guid.NewGuid().ToString())),
+                options
+            );
+
+            Assert.AreEqual(typeof(CosmosSystemTextJsonSerializer), client.ClientOptions.Serializer.GetType());
+        }
+
+        [TestMethod]
+        [ExpectedException(typeof(ArgumentException))]
+        public void ThrowOnSerializerOptionsWithCustomSerializer()
+        {
+            _ = new CosmosClientOptions
+            {
+                Serializer = new CosmosJsonDotNetSerializer(),
+                SerializerOptions = new CosmosSerializationOptions()
+            };
         }
 
         [TestMethod]
         [ExpectedException(typeof(ArgumentException))]
         public void ThrowOnCustomSerializerWithSerializerOptions()
         {
-            CosmosClientOptions options = new CosmosClientOptions()
+            _ = new CosmosClientOptions
             {
-                SerializerOptions = new CosmosSerializationOptions()
+                SerializerOptions = new CosmosSerializationOptions(),
+                Serializer = new CosmosJsonDotNetSerializer()
+            };
+        }
+
+        [TestMethod]
+        [DataRow(false, DisplayName = "Test when the client options order is maintained")]
+        [DataRow(true, DisplayName = "Test when the client options order is reversed")]
+        [ExpectedException(typeof(ArgumentException))]
+        public void ThrowOnCustomSerializerWithSTJSerializerEnabled(
+            bool reverseOrder)
+        {
+            _ = reverseOrder
+                ? new CosmosClientOptions()
+                {
+                    Serializer = new CosmosJsonDotNetSerializer(),
+                    UseSystemTextJsonSerializerWithOptions = new System.Text.Json.JsonSerializerOptions(),
+                }
+                : new CosmosClientOptions()
+                {
+                    UseSystemTextJsonSerializerWithOptions = new System.Text.Json.JsonSerializerOptions(),
+                    Serializer = new CosmosJsonDotNetSerializer(),
+                };
+        }
+
+        [TestMethod]
+        [DataRow(false, DisplayName = "Test when the client options order is maintained")]
+        [DataRow(true, DisplayName = "Test when the client options order is reversed")]
+        [ExpectedException(typeof(ArgumentException))]
+        public void ThrowOnSerializerOptionsWithSTJSerializerEnabled(
+            bool reverseOrder)
+        {
+            _ = reverseOrder
+                ? new CosmosClientOptions()
+                {
+                    SerializerOptions = new CosmosSerializationOptions(),
+                    UseSystemTextJsonSerializerWithOptions = new System.Text.Json.JsonSerializerOptions(),
+                }
+                : new CosmosClientOptions()
+                {
+                    UseSystemTextJsonSerializerWithOptions = new System.Text.Json.JsonSerializerOptions(),
+                    SerializerOptions = new CosmosSerializationOptions(),
+                };
+        }
+
+        [TestMethod]
+        public void GetSerializedConfiguration_WithSTJSerializerOptions_DoesNotThrow()
+        {
+            System.Text.Json.JsonSerializerOptions jsonSerializerOptions = new System.Text.Json.JsonSerializerOptions()
+            {
+                PropertyNamingPolicy = System.Text.Json.JsonNamingPolicy.CamelCase,
             };
 
-            options.Serializer = new CosmosJsonDotNetSerializer();
+            // Set a TypeInfoResolver via reflection to reproduce the circular reference
+            // scenario from the bug report (TypeInfoResolver → Options → TypeInfoResolver).
+            // TypeInfoResolver was introduced in .NET 7 and is not available at compile time
+            // with the STJ 6.0 package reference, but is available at runtime on .NET 7+.
+            PropertyInfo typeInfoResolverProp = typeof(System.Text.Json.JsonSerializerOptions)
+                .GetProperty("TypeInfoResolver");
+
+            if (typeInfoResolverProp != null)
+            {
+                Type defaultResolverType = typeof(System.Text.Json.JsonSerializerOptions).Assembly
+                    .GetType("System.Text.Json.Serialization.Metadata.DefaultJsonTypeInfoResolver");
+
+                if (defaultResolverType != null)
+                {
+                    typeInfoResolverProp.SetValue(jsonSerializerOptions, Activator.CreateInstance(defaultResolverType));
+                }
+            }
+
+            CosmosClientOptions options = new CosmosClientOptions()
+            {
+                UseSystemTextJsonSerializerWithOptions = jsonSerializerOptions,
+            };
+
+            string serializedConfig = options.GetSerializedConfiguration();
+            Assert.IsNotNull(serializedConfig);
+            Assert.IsTrue(serializedConfig.Contains("System.Text.Json.JsonSerializerOptions"));
         }
 
         [TestMethod]
@@ -326,7 +796,7 @@ namespace Microsoft.Azure.Cosmos.Tests
         [ExpectedException(typeof(ArgumentException))]
         public void ThrowOnMissingAccountKeyInConnectionString()
         {
-            string invalidConnectionString = "AccountEndpoint=https://localtestcosmos.documents.azure.com:443/;";
+            string invalidConnectionString = "AccountEndpoint=https://example.documents.azure.com:443/;";
             new CosmosClientBuilder(invalidConnectionString);
         }
 
@@ -334,7 +804,7 @@ namespace Microsoft.Azure.Cosmos.Tests
         [ExpectedException(typeof(ArgumentException))]
         public void ThrowOnMissingAccountEndpointInConnectionString()
         {
-            string invalidConnectionString = "AccountKey=425Mcv8CXQqzRNCgFNjIhT424GK99CKJvASowTnq15Vt8LeahXTcN5wt3342vQ==;";
+            string invalidConnectionString = "AccountKey=NotRealKey==;";
             new CosmosClientBuilder(invalidConnectionString);
         }
 
@@ -350,11 +820,11 @@ namespace Microsoft.Azure.Cosmos.Tests
             {
                 ConnectionMode = ConnectionMode.Gateway
             };
-            
-            Assert.ThrowsException<ArgumentException>(() => { cosmosClientOptions.IdleTcpConnectionTimeout = idleTcpConnectionTimeout; });
-            Assert.ThrowsException<ArgumentException>(() => { cosmosClientOptions.OpenTcpConnectionTimeout = openTcpConnectionTimeout; });
-            Assert.ThrowsException<ArgumentException>(() => { cosmosClientOptions.MaxRequestsPerTcpConnection = maxRequestsPerTcpConnection; });
-            Assert.ThrowsException<ArgumentException>(() => { cosmosClientOptions.MaxTcpConnectionsPerEndpoint = maxTcpConnectionsPerEndpoint; });
+
+            Assert.ThrowsException<ArgumentException>(() => cosmosClientOptions.IdleTcpConnectionTimeout = idleTcpConnectionTimeout);
+            Assert.ThrowsException<ArgumentException>(() => cosmosClientOptions.OpenTcpConnectionTimeout = openTcpConnectionTimeout);
+            Assert.ThrowsException<ArgumentException>(() => cosmosClientOptions.MaxRequestsPerTcpConnection = maxRequestsPerTcpConnection);
+            Assert.ThrowsException<ArgumentException>(() => cosmosClientOptions.MaxTcpConnectionsPerEndpoint = maxTcpConnectionsPerEndpoint);
         }
 
         [TestMethod]
@@ -365,27 +835,21 @@ namespace Microsoft.Azure.Cosmos.Tests
                 GatewayModeMaxConnectionLimit = 42
             };
 
-            Assert.ThrowsException<ArgumentException>(() =>
-            {
-                cosmosClientOptions.HttpClientFactory = () => new HttpClient();
-            });
+            Assert.ThrowsException<ArgumentException>(() => cosmosClientOptions.HttpClientFactory = () => new HttpClient());
 
             cosmosClientOptions = new CosmosClientOptions()
             {
                 HttpClientFactory = () => new HttpClient()
             };
 
-            Assert.ThrowsException<ArgumentException>(() =>
-            {
-                cosmosClientOptions.GatewayModeMaxConnectionLimit = 42;
-            });
+            Assert.ThrowsException<ArgumentException>(() => cosmosClientOptions.GatewayModeMaxConnectionLimit = 42);
         }
 
         [TestMethod]
         public void VerifyHttpClientHandlerIsSet()
         {
             string endpoint = AccountEndpoint;
-            string key = "425Mcv8CXQqzRNCgFNjIhT424GK99CKJvASowTnq15Vt8LeahXTcN5wt3342vQ==";
+            string key = "NotRealKey==";
 
             IWebProxy webProxy = new TestWebProxy();
 
@@ -399,8 +863,12 @@ namespace Microsoft.Azure.Cosmos.Tests
             CosmosClient cosmosClient = cosmosClientBuilder.Build();
             CosmosHttpClient cosmosHttpClient = cosmosClient.DocumentClient.httpClient;
             SocketsHttpHandler handler = (SocketsHttpHandler)cosmosHttpClient.HttpMessageHandler;
-            
+
             Assert.IsTrue(object.ReferenceEquals(webProxy, handler.Proxy));
+            Assert.IsTrue(handler.EnableMultipleHttp2Connections, "EnableMultipleHttp2Connections should be set through the builder pipeline");
+            Assert.AreEqual(TimeSpan.FromSeconds(1), handler.KeepAlivePingDelay, "KeepAlivePingDelay should be set through the builder pipeline");
+            Assert.AreEqual(TimeSpan.FromSeconds(2), handler.KeepAlivePingTimeout, "KeepAlivePingTimeout should be set through the builder pipeline");
+            Assert.AreEqual(HttpKeepAlivePingPolicy.Always, handler.KeepAlivePingPolicy, "KeepAlivePingPolicy should be set through the builder pipeline");
         }
 
         [TestMethod]
@@ -418,6 +886,8 @@ namespace Microsoft.Azure.Cosmos.Tests
         public void VerifyLimitToEndpointSettings()
         {
             CosmosClientOptions cosmosClientOptions = new CosmosClientOptions { ApplicationRegion = Regions.EastUS, LimitToEndpoint = true };
+
+            // For invalid regions GetConnectionPolicy will throw exception
             cosmosClientOptions.GetConnectionPolicy(clientId: 0);
         }
 
@@ -426,6 +896,8 @@ namespace Microsoft.Azure.Cosmos.Tests
         public void VerifyLimitToEndpointSettingsWithPreferredRegions()
         {
             CosmosClientOptions cosmosClientOptions = new CosmosClientOptions { ApplicationPreferredRegions = new List<string>() { Regions.EastUS }, LimitToEndpoint = true };
+
+            // For invalid regions GetConnectionPolicy will throw exception
             cosmosClientOptions.GetConnectionPolicy(clientId: 0);
         }
 
@@ -434,25 +906,55 @@ namespace Microsoft.Azure.Cosmos.Tests
         public void VerifyApplicationRegionSettingsWithPreferredRegions()
         {
             CosmosClientOptions cosmosClientOptions = new CosmosClientOptions { ApplicationPreferredRegions = new List<string>() { Regions.EastUS }, ApplicationRegion = Regions.EastUS };
+
+            // For invalid regions GetConnectionPolicy will throw exception
             cosmosClientOptions.GetConnectionPolicy(clientId: 0);
+        }
+
+        [TestMethod]
+        [DynamicData(nameof(GetPublicRegionNames), DynamicDataSourceType.Method)]
+        public void VerifyApplicationRegionSettingsForAllPublicRegions(string regionName)
+        {
+            CosmosClientOptions cosmosClientOptions = new CosmosClientOptions { ApplicationRegion = regionName };
+
+            // For invalid regions GetConnectionPolicy will throw exception
+            cosmosClientOptions.GetConnectionPolicy(clientId: 0);
+        }
+
+        private static IEnumerable<object[]> GetPublicRegionNames()
+        {
+            List<object[]> regionNames = new List<object[]>();
+
+            // BindingFlags.FlattenHierarchy MUST for const fields 
+            foreach (FieldInfo fieldInfo in typeof(Regions).GetFields(BindingFlags.Public | BindingFlags.Static | BindingFlags.FlattenHierarchy))
+            {
+                string regionValue = fieldInfo.GetValue(null).ToString();
+                regionNames.Add(new object[] { regionValue });
+            }
+
+            return regionNames;
         }
 
         [TestMethod]
         [ExpectedException(typeof(ArgumentException))]
         public void VerifyWebProxyHttpClientFactorySet()
         {
-            CosmosClientOptions cosmosClientOptions = new CosmosClientOptions();
-            cosmosClientOptions.WebProxy = Mock.Of<WebProxy>();
-            cosmosClientOptions.HttpClientFactory = () => new HttpClient();
+            CosmosClientOptions cosmosClientOptions = new CosmosClientOptions
+            {
+                WebProxy = Mock.Of<WebProxy>(),
+                HttpClientFactory = () => new HttpClient()
+            };
         }
 
         [TestMethod]
         [ExpectedException(typeof(ArgumentException))]
         public void VerifyHttpClientFactoryWebProxySet()
         {
-            CosmosClientOptions cosmosClientOptions = new CosmosClientOptions();
-            cosmosClientOptions.HttpClientFactory = () => new HttpClient();
-            cosmosClientOptions.WebProxy = Mock.Of<WebProxy>();
+            CosmosClientOptions cosmosClientOptions = new CosmosClientOptions
+            {
+                HttpClientFactory = () => new HttpClient(),
+                WebProxy = Mock.Of<WebProxy>()
+            };
         }
 
         [TestMethod]
@@ -540,6 +1042,176 @@ namespace Microsoft.Azure.Cosmos.Tests
         }
 
         [TestMethod]
+        public void VerifyRegionNameFormatConversionForApplicationRegion()
+        {
+            CosmosClientOptions cosmosClientOptions = new CosmosClientOptions
+            {
+                ApplicationRegion = "westus2"
+            };
+
+            ConnectionPolicy policy = cosmosClientOptions.GetConnectionPolicy(0);
+
+            // Need to see Regions.WestUS2 in the list, but not "westus2"
+            bool seenWestUS2 = false;
+            bool seenNormalized = false;
+
+            foreach (string region in policy.PreferredLocations)
+            {
+                if (region == "westus2")
+                {
+                    seenNormalized = true;
+                }
+
+                if (region == Regions.WestUS2)
+                {
+                    seenWestUS2 = true;
+                }
+            }
+            Assert.IsTrue(seenWestUS2);
+            Assert.IsFalse(seenNormalized);
+        }
+
+        [TestMethod]
+        public void VerifyRegionNameFormatConversionBypassForApplicationRegion()
+        {
+            CosmosClientOptions cosmosClientOptions = new CosmosClientOptions
+            {
+                // No conversion for expected format.
+                ApplicationRegion = Regions.NorthCentralUS
+            };
+
+            ConnectionPolicy policy = cosmosClientOptions.GetConnectionPolicy(0);
+
+            Assert.AreEqual(Regions.NorthCentralUS, policy.PreferredLocations[0]);
+
+            // Ignore unknown values. 
+            cosmosClientOptions.ApplicationRegion = null;
+
+            policy = cosmosClientOptions.GetConnectionPolicy(0);
+
+            Assert.AreEqual(0, policy.PreferredLocations.Count);
+
+            cosmosClientOptions.ApplicationRegion = string.Empty;
+            policy = cosmosClientOptions.GetConnectionPolicy(0);
+
+            Assert.AreEqual(0, policy.PreferredLocations.Count);
+
+            cosmosClientOptions.ApplicationRegion = "Invalid region";
+            Assert.ThrowsException<ArgumentException>(() => cosmosClientOptions.GetConnectionPolicy(0));
+        }
+
+        [TestMethod]
+        public void VerifyRegionNameFormatConversionForApplicationPreferredRegions()
+        {
+            CosmosClientOptions cosmosClientOptions = new CosmosClientOptions
+            {
+                ApplicationPreferredRegions = new List<string> { "westus2", "usdodcentral", Regions.ChinaNorth3 }
+            };
+
+            ConnectionPolicy policy = cosmosClientOptions.GetConnectionPolicy(0);
+
+            bool seenUSDodCentral = false;
+            bool seenWestUS2 = false;
+            bool seenChinaNorth3 = false;
+            bool seenNormalizedUSDodCentral = false;
+            bool seenNormalizedWestUS2 = false;
+
+            foreach (string region in policy.PreferredLocations)
+            {
+                if (region == Regions.USDoDCentral)
+                {
+                    seenUSDodCentral = true;
+                }
+
+                if (region == Regions.WestUS2)
+                {
+                    seenWestUS2 = true;
+                }
+
+                if (region == Regions.ChinaNorth3)
+                {
+                    seenChinaNorth3 = true;
+                }
+
+                if (region == "westus2")
+                {
+                    seenNormalizedWestUS2 = true;
+                }
+
+                if (region == "usdodcentral")
+                {
+                    seenNormalizedUSDodCentral = true;
+                }
+            }
+
+            Assert.IsTrue(seenChinaNorth3);
+            Assert.IsTrue(seenWestUS2);
+            Assert.IsTrue(seenUSDodCentral);
+            Assert.IsFalse(seenNormalizedUSDodCentral);
+            Assert.IsFalse(seenNormalizedWestUS2);
+        }
+
+        [TestMethod]
+        public void VerifyRegionNameFormatConversionBypassForInvalidApplicationPreferredRegions()
+        {
+            CosmosClientOptions cosmosClientOptions = new CosmosClientOptions
+            {
+                // List contains valid and invalid values
+                ApplicationPreferredRegions = new List<string>
+            {
+                null,
+                string.Empty,
+                Regions.JioIndiaCentral,
+                "westus2",
+                "Invalid region"
+            }
+            };
+
+            ConnectionPolicy policy = cosmosClientOptions.GetConnectionPolicy(0);
+
+            bool seenJioIndiaCentral = false;
+            bool seenWestUS2 = false;
+            bool seenNormalized = false;
+
+            foreach (string region in policy.PreferredLocations)
+            {
+                if (region == Regions.JioIndiaCentral)
+                {
+                    seenJioIndiaCentral = true;
+                }
+
+                if (region == Regions.WestUS2)
+                {
+                    seenWestUS2 = true;
+                }
+
+                if (region == "westus2")
+                {
+                    seenNormalized = true;
+                }
+            }
+
+            Assert.IsTrue(seenJioIndiaCentral);
+            Assert.IsTrue(seenWestUS2);
+            Assert.IsFalse(seenNormalized);
+        }
+
+        [TestMethod]
+        public void RegionNameMappingTest()
+        {
+            RegionNameMapper mapper = new RegionNameMapper();
+
+            // Test normalized name
+            Assert.AreEqual(Regions.WestUS2, mapper.GetCosmosDBRegionName("westus2"));
+
+            // Test with spaces
+            Assert.AreEqual(Regions.WestUS2, mapper.GetCosmosDBRegionName("west us 2"));
+
+            // Test for case insenstive
+            Assert.AreEqual(Regions.WestUS2, mapper.GetCosmosDBRegionName("wEsTuS2"));
+        }
+
+        [TestMethod]
         public void InvalidApplicationNameCatchTest()
         {
 
@@ -564,6 +1236,75 @@ namespace Microsoft.Azure.Cosmos.Tests
                     ApplicationName = illegal
                 });
             }
+        }
+
+        [TestMethod]
+        [DataRow(ConnectionString, false)]
+        [DataRow(ConnectionString + "DisableServerCertificateValidation=true;", true)]
+        [DataRow(ConnectionString + "DisableServerCertificateValidation=false;", false)]
+        public void TestServerCertificatesValidationCallback(string connStr, bool expectedIgnoreCertificateFlag)
+        {
+            //Arrange
+            X509Certificate2 x509Certificate2 = new CertificateRequest("cn=www.test", ECDsa.Create(), HashAlgorithmName.SHA256).CreateSelfSigned(DateTime.Now, DateTime.Now.AddYears(1));
+            X509Chain x509Chain = new X509Chain();
+            SslPolicyErrors sslPolicyErrors = new SslPolicyErrors();
+
+            CosmosClient cosmosClient = new CosmosClient(connStr);
+
+            if (expectedIgnoreCertificateFlag)
+            {
+                Assert.IsNull(cosmosClient.ClientOptions.ServerCertificateCustomValidationCallback);
+                Assert.IsNull(cosmosClient.DocumentClient.ConnectionPolicy.ServerCertificateCustomValidationCallback);
+                Assert.IsTrue(cosmosClient.ClientOptions.DisableServerCertificateValidation);
+                Assert.IsTrue(cosmosClient
+                    .ClientOptions
+                    .GetServerCertificateCustomValidationCallback()(x509Certificate2, x509Chain, sslPolicyErrors));
+
+
+                CosmosHttpClient httpClient = cosmosClient.DocumentClient.httpClient;
+                SocketsHttpHandler socketsHttpHandler = (SocketsHttpHandler)httpClient.HttpMessageHandler;
+
+                RemoteCertificateValidationCallback httpClientRemoreCertValidationCallback = socketsHttpHandler.SslOptions.RemoteCertificateValidationCallback;
+                Assert.IsNotNull(httpClientRemoreCertValidationCallback);
+
+                Assert.IsTrue(httpClientRemoreCertValidationCallback(this, x509Certificate2, x509Chain, sslPolicyErrors));
+            }
+            else
+            {
+                Assert.IsNull(cosmosClient.ClientOptions.ServerCertificateCustomValidationCallback);
+                Assert.IsFalse(cosmosClient.ClientOptions.DisableServerCertificateValidation);
+
+                Assert.IsNull(cosmosClient.DocumentClient.ConnectionPolicy.ServerCertificateCustomValidationCallback);
+            }
+        }
+
+        [TestMethod]
+        [DataRow(ConnectionString + "DisableServerCertificateValidation=true;", true)]
+        [DataRow(ConnectionString + "DisableServerCertificateValidation=true;", false)]
+        public void TestServerCertificatesValidationWithDisableSSLFlagTrue(string connStr, bool setCallback)
+        {
+            CosmosClientOptions options = new CosmosClientOptions
+            {
+                ServerCertificateCustomValidationCallback = (certificate, chain, sslPolicyErrors) => true,
+            };
+
+            if (setCallback)
+            {
+                options.DisableServerCertificateValidationInvocationCallback = () => { };
+            }
+
+            CosmosClient cosmosClient = new CosmosClient(connStr, options);
+            Assert.IsTrue(cosmosClient.ClientOptions.DisableServerCertificateValidation);
+            Assert.AreEqual(cosmosClient.ClientOptions.ServerCertificateCustomValidationCallback, options.ServerCertificateCustomValidationCallback);
+            Assert.AreEqual(cosmosClient.DocumentClient.ConnectionPolicy.ServerCertificateCustomValidationCallback, options.ServerCertificateCustomValidationCallback);
+
+            CosmosHttpClient httpClient = cosmosClient.DocumentClient.httpClient;
+            SocketsHttpHandler socketsHttpHandler = (SocketsHttpHandler)httpClient.HttpMessageHandler;
+
+#nullable enable
+            RemoteCertificateValidationCallback? httpClientRemoreCertValidationCallback = socketsHttpHandler.SslOptions.RemoteCertificateValidationCallback;
+            Assert.IsNotNull(httpClientRemoreCertValidationCallback);
+#nullable disable
         }
 
         private class TestWebProxy : IWebProxy

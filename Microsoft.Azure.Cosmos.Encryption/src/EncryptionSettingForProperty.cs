@@ -17,6 +17,11 @@ namespace Microsoft.Azure.Cosmos.Encryption
 
         private readonly EncryptionContainer encryptionContainer;
 
+        // Test-only hook: when provided, BuildEncryptionAlgorithmForSettingAsync returns this instance
+        // instead of constructing one via key fetching/unwrapping. This is internal and used only by tests
+        // through InternalsVisibleTo.
+        private readonly Microsoft.Data.Encryption.Cryptography.AeadAes256CbcHmac256EncryptionAlgorithm injectedAlgorithm;
+
         public EncryptionSettingForProperty(
             string clientEncryptionKeyId,
             Data.Encryption.Cryptography.EncryptionType encryptionType,
@@ -29,12 +34,32 @@ namespace Microsoft.Azure.Cosmos.Encryption
             this.databaseRid = string.IsNullOrEmpty(databaseRid) ? throw new ArgumentNullException(nameof(databaseRid)) : databaseRid;
         }
 
+        // Internal constructor for tests to inject a ready algorithm to enable end-to-end unit testing
+        // without standing up key providers. Other parameters remain for traceability but are not used
+        // when an injected algorithm is supplied.
+        internal EncryptionSettingForProperty(
+            string clientEncryptionKeyId,
+            Data.Encryption.Cryptography.EncryptionType encryptionType,
+            EncryptionContainer encryptionContainer,
+            string databaseRid,
+            AeadAes256CbcHmac256EncryptionAlgorithm injectedAlgorithm)
+            : this(clientEncryptionKeyId, encryptionType, encryptionContainer, databaseRid)
+        {
+            this.injectedAlgorithm = injectedAlgorithm ?? throw new ArgumentNullException(nameof(injectedAlgorithm));
+        }
+
         public string ClientEncryptionKeyId { get; }
 
         public Data.Encryption.Cryptography.EncryptionType EncryptionType { get; }
 
         public async Task<AeadAes256CbcHmac256EncryptionAlgorithm> BuildEncryptionAlgorithmForSettingAsync(CancellationToken cancellationToken)
         {
+            // Return the injected algorithm if provided (test-only path)
+            if (this.injectedAlgorithm != null)
+            {
+                return this.injectedAlgorithm;
+            }
+
             ClientEncryptionKeyProperties clientEncryptionKeyProperties = await this.encryptionContainer.EncryptionCosmosClient.GetClientEncryptionKeyPropertiesAsync(
                     clientEncryptionKeyId: this.ClientEncryptionKeyId,
                     encryptionContainer: this.encryptionContainer,
@@ -97,7 +122,8 @@ namespace Microsoft.Azure.Cosmos.Encryption
         /// Helper function which force refreshes the gateway cache to fetch the latest client encryption key to build ProtectedDataEncryptionKey object for the encryption setting.
         /// </summary>
         /// <param name="existingCekEtag">Client encryption key etag to be passed, which is used as If-None-Match Etag for the request. </param>
-        /// <param name="cancellationToken"> cacellation token. </param>
+        /// <param name="refreshRetriedOnException"> KEK expired exception. </param>
+        /// <param name="cancellationToken"> Cancellation token. </param>
         /// <returns>ProtectedDataEncryptionKey object. </returns>
         private async Task<ProtectedDataEncryptionKey> ForceRefreshGatewayCacheAndBuildProtectedDataEncryptionKeyAsync(
             string existingCekEtag,

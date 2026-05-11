@@ -5,6 +5,7 @@
 namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
 {
     using System;
+    using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Collections.ObjectModel;
     using System.Globalization;
@@ -12,6 +13,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
     using System.Linq;
     using System.Net;
     using System.Net.Http;
+    using System.Reflection;
     using System.Security.Cryptography;
     using System.Text;
     using System.Threading;
@@ -28,6 +30,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
     using Microsoft.Azure.Documents.Routing;
     using Microsoft.VisualStudio.TestTools.UnitTesting;
     using Newtonsoft.Json;
+    using static Microsoft.Azure.Cosmos.Routing.GlobalPartitionEndpointManagerCore;
 
     internal static class TestCommon
     {
@@ -71,6 +74,11 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
             string endpoint = ConfigurationManager.AppSettings["GatewayEndpoint"];
 
             return (endpoint, authKey);
+        }
+
+        internal static string GetMultiRegionConnectionString()
+        {
+            return Cosmos.ConfigurationManager.GetEnvironmentVariable<string>("COSMOSDB_MULTI_REGION", string.Empty);
         }
 
         internal static CosmosClientBuilder GetDefaultConfiguration(
@@ -130,8 +138,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
 
         internal static CosmosClient CreateCosmosClient(
             bool useGateway,
-            Action<CosmosClientBuilder> customizeClientBuilder = null,
-            bool enableDistributingTracing = false)
+            Action<CosmosClientBuilder> customizeClientBuilder = null)
         {
             CosmosClientBuilder cosmosClientBuilder = GetDefaultConfiguration();
 
@@ -140,14 +147,6 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
             if (useGateway)
             {
                 cosmosClientBuilder.WithConnectionModeGateway();
-            }
-
-            if(enableDistributingTracing)
-            {
-                cosmosClientBuilder.WithDistributedTracingOptions(new DistributedTracingOptions()
-                {
-                    LatencyThresholdForDiagnosticEvent = TimeSpan.FromMilliseconds(0)
-                });
             }
             
             return cosmosClientBuilder.Build();
@@ -164,8 +163,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
             RetryOptions retryOptions = null,
             ApiType apiType = ApiType.None,
             EventHandler<ReceivedResponseEventArgs> recievedResponseEventHandler = null,
-            bool useMultipleWriteLocations = false,
-            bool enableClientTelemetry = false)
+            bool useMultipleWriteLocations = false)
         {
             string authKey = ConfigurationManager.AppSettings["MasterKey"];
 
@@ -248,6 +246,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 apiType,
                 recievedResponseEventHandler);
 
+            client.EnsureValidClientAsync(NoOpTrace.Singleton).Wait();
             return client;
         }
 
@@ -1580,6 +1579,36 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
             {
                 throw new ArgumentException();
             }
+        }
+
+        public static PartitionKeyRangeFailoverInfo GetFailoverInfoForFirstPartitionUsingReflection(
+            GlobalPartitionEndpointManager globalPartitionEndpointManager,
+            bool isReadOnlyOrMultiMaster)
+        {
+            string fieldName = isReadOnlyOrMultiMaster
+                ? "PartitionKeyRangeToLocationForReadAndWrite"
+                : "PartitionKeyRangeToLocationForWrite";
+
+            if (globalPartitionEndpointManager is GlobalPartitionEndpointManagerCore globalPartitionEndpointManagerCore)
+            {
+                FieldInfo fieldInfo = globalPartitionEndpointManagerCore
+                    .GetType()
+                    .GetField(
+                        name: fieldName,
+                        bindingAttr: BindingFlags.Instance | BindingFlags.NonPublic)
+                    ?? throw new InvalidOperationException($"Could not find '{fieldName}' field on GlobalPartitionEndpointManagerCore.");
+
+                Lazy<ConcurrentDictionary<Documents.PartitionKeyRange, PartitionKeyRangeFailoverInfo>> pkRangeMappings = (Lazy<ConcurrentDictionary<Documents.PartitionKeyRange, PartitionKeyRangeFailoverInfo>>)fieldInfo
+                        .GetValue(
+                            obj: globalPartitionEndpointManagerCore);
+
+                if (pkRangeMappings.IsValueCreated)
+                {
+                    return pkRangeMappings.Value?.First().Value;
+                }
+            }
+
+            return null;
         }
 
         private class DisposableList : IDisposable

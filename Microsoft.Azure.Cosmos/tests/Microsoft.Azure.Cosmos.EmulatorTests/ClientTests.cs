@@ -5,6 +5,7 @@
 namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
 {
     using System;
+    using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Diagnostics;
     using System.IO;
@@ -13,11 +14,13 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
     using System.Net.Http;
     using System.Net.Security;
     using System.Reflection;
+    using System.Runtime.Serialization.Json;
     using System.Security.Cryptography.X509Certificates;
     using System.Text;
     using System.Threading;
     using System.Threading.Tasks;
     using global::Azure;
+    using Microsoft.Azure.Cosmos.FaultInjection;
     using Microsoft.Azure.Cosmos.Query.Core;
     using Microsoft.Azure.Cosmos.Services.Management.Tests.LinqProviderTests;
     using Microsoft.Azure.Cosmos.Telemetry;
@@ -290,6 +293,24 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
             }
         }
 
+        [TestMethod]
+        public async Task ValidateTryGetAccountProperties()
+        {
+            using CosmosClient cosmosClient = new CosmosClient(
+                ConfigurationManager.AppSettings["GatewayEndpoint"],
+                ConfigurationManager.AppSettings["MasterKey"]
+            );
+
+            Assert.IsFalse(cosmosClient.DocumentClient.TryGetCachedAccountProperties(out AccountProperties propertiesFromMethod));
+
+            AccountProperties accountProperties = await cosmosClient.ReadAccountAsync();
+
+            Assert.IsTrue(cosmosClient.DocumentClient.TryGetCachedAccountProperties(out propertiesFromMethod));
+
+            Assert.AreEqual(accountProperties.Consistency.DefaultConsistencyLevel, propertiesFromMethod.Consistency.DefaultConsistencyLevel);
+            Assert.AreEqual(accountProperties.Id, propertiesFromMethod.Id);
+        }
+
         private int TaskStartedCount = 0;
 
         private async Task<Exception> ReadNotFound(Container container)
@@ -381,7 +402,7 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
             string sdkSupportedCapability = sdkSupportedCapabilities.Single();
             ulong capability = ulong.Parse(sdkSupportedCapability);
 
-            Assert.AreEqual((ulong)SDKSupportedCapabilities.PartitionMerge, capability & (ulong)SDKSupportedCapabilities.PartitionMerge,$" received header value as {sdkSupportedCapability}");
+            Assert.AreEqual((ulong)(SDKSupportedCapabilities.PartitionMerge | SDKSupportedCapabilities.IgnoreUnknownRntbdTokens), capability & (ulong)(SDKSupportedCapabilities.PartitionMerge | SDKSupportedCapabilities.IgnoreUnknownRntbdTokens), $"received header value as {sdkSupportedCapability}");
         }
 
         [TestMethod]
@@ -489,161 +510,147 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
         }
 
         [TestMethod]
+        public async Task Verify_DisableCertificateValidationCallBackGetsCalled_ForTCP_HTTP()
+        {
+            int counter = 0;
+            CosmosClientOptions options = new CosmosClientOptions()
+            {
+                DisableServerCertificateValidationInvocationCallback = () => counter++,
+            };
+
+            string authKey = ConfigurationManager.AppSettings["MasterKey"];
+            string endpoint = ConfigurationManager.AppSettings["GatewayEndpoint"];
+            string connectionStringWithSslDisable = $"AccountEndpoint={endpoint};AccountKey={authKey};DisableServerCertificateValidation=true";
+
+            using CosmosClient cosmosClient = new CosmosClient(connectionStringWithSslDisable, options);
+
+            string databaseName = Guid.NewGuid().ToString();
+            string databaseId = Guid.NewGuid().ToString();
+            Cosmos.Database database = null;
+
+            try
+            {
+                //HTTP callback
+                Trace.TraceInformation("Creating test database and container");
+                database = await cosmosClient.CreateDatabaseAsync(databaseId);
+                Cosmos.Container container = await database.CreateContainerAsync(Guid.NewGuid().ToString(), "/id");
+
+                // TCP callback
+                ToDoActivity item = ToDoActivity.CreateRandomToDoActivity();
+                ResponseMessage responseMessage = await container.CreateItemStreamAsync(TestCommon.SerializerCore.ToStream(item), new Cosmos.PartitionKey(item.id));
+            }
+            finally
+            {
+                await database?.DeleteStreamAsync();
+            }
+
+            Assert.IsTrue(counter >= 2);
+        }
+
+        [TestMethod]
         public void SqlQuerySpecSerializationTest()
         {
             Action<string, SqlQuerySpec> verifyJsonSerialization = (expectedText, query) =>
             {
-                string actualText = JsonConvert.SerializeObject(query);
+                string actualText = SerializeQuerySpecToJson(query);
+                SqlQuerySpec querySpec = DeserializeJsonToQuerySpec(actualText);
+                string otherText = SerializeQuerySpecToJson(querySpec);
 
                 Assert.AreEqual(expectedText, actualText);
-
-                SqlQuerySpec otherQuery = JsonConvert.DeserializeObject<SqlQuerySpec>(actualText);
-                string otherText = JsonConvert.SerializeObject(otherQuery);
                 Assert.AreEqual(expectedText, otherText);
             };
 
             Action<string> verifyJsonSerializationText = (text) =>
             {
-                SqlQuerySpec query = JsonConvert.DeserializeObject<SqlQuerySpec>(text);
-                string otherText = JsonConvert.SerializeObject(query);
+
+                SqlQuerySpec querySpec = DeserializeJsonToQuerySpec(text);
+                string otherText = SerializeQuerySpecToJson(querySpec);
 
                 Assert.AreEqual(text, otherText);
             };
 
             // Verify serialization
-            verifyJsonSerialization("{\"query\":null}", new SqlQuerySpec());
-            verifyJsonSerialization("{\"query\":\"SELECT 1\"}", new SqlQuerySpec("SELECT 1"));
-            verifyJsonSerialization("{\"query\":\"SELECT 1\",\"parameters\":[{\"name\":null,\"value\":null}]}",
+            verifyJsonSerialization("{\"parameters\":[],\"query\":null}", new SqlQuerySpec());
+            verifyJsonSerialization("{\"parameters\":[],\"query\":\"SELECT 1\"}", new SqlQuerySpec("SELECT 1"));
+            verifyJsonSerialization("{\"parameters\":[{\"name\":null,\"value\":null}],\"query\":\"SELECT 1\"}",
                 new SqlQuerySpec()
                 {
                     QueryText = "SELECT 1",
                     Parameters = new SqlParameterCollection() { new SqlParameter() }
                 });
 
-            verifyJsonSerialization("{\"query\":\"SELECT 1\",\"parameters\":[" +
+            verifyJsonSerialization("{\"parameters\":[" +
                     "{\"name\":\"@p1\",\"value\":5}" +
-                "]}",
+                "],\"query\":\"SELECT 1\"}",
                 new SqlQuerySpec()
                 {
                     QueryText = "SELECT 1",
                     Parameters = new SqlParameterCollection() { new SqlParameter("@p1", 5) }
                 });
-            verifyJsonSerialization("{\"query\":\"SELECT 1\",\"parameters\":[" +
+            verifyJsonSerialization("{\"parameters\":[" +
                     "{\"name\":\"@p1\",\"value\":5}," +
                     "{\"name\":\"@p1\",\"value\":true}" +
-                "]}",
+                "],\"query\":\"SELECT 1\"}",
                 new SqlQuerySpec()
                 {
                     QueryText = "SELECT 1",
                     Parameters = new SqlParameterCollection() { new SqlParameter("@p1", 5), new SqlParameter("@p1", true) }
                 });
-            verifyJsonSerialization("{\"query\":\"SELECT 1\",\"parameters\":[" +
+            verifyJsonSerialization("{\"parameters\":[" +
                     "{\"name\":\"@p1\",\"value\":\"abc\"}" +
-                "]}",
+                "],\"query\":\"SELECT 1\"}",
                 new SqlQuerySpec()
                 {
                     QueryText = "SELECT 1",
                     Parameters = new SqlParameterCollection() { new SqlParameter("@p1", "abc") }
                 });
-            verifyJsonSerialization("{\"query\":\"SELECT 1\",\"parameters\":[" +
+            verifyJsonSerialization("{\"parameters\":[" +
                     "{\"name\":\"@p1\",\"value\":[1,2,3]}" +
-                "]}",
+                "],\"query\":\"SELECT 1\"}",
                 new SqlQuerySpec()
                 {
                     QueryText = "SELECT 1",
                     Parameters = new SqlParameterCollection() { new SqlParameter("@p1", new int[] { 1, 2, 3 }) }
                 });
-            verifyJsonSerialization("{\"query\":\"SELECT 1\",\"parameters\":[" +
-                    "{\"name\":\"@p1\",\"value\":{\"a\":[1,2,3]}}" +
-                "]}",
-                new SqlQuerySpec()
-                {
-                    QueryText = "SELECT 1",
-                    Parameters = new SqlParameterCollection() { new SqlParameter("@p1", JObject.Parse("{\"a\":[1,2,3]}")) }
-                });
-            verifyJsonSerialization("{\"query\":\"SELECT 1\",\"parameters\":[" +
-                    "{\"name\":\"@p1\",\"value\":{\"a\":[1,2,3]}}" +
-                "]}",
-                new SqlQuerySpec()
-                {
-                    QueryText = "SELECT 1",
-                    Parameters = new SqlParameterCollection() { new SqlParameter("@p1", new JRaw("{\"a\":[1,2,3]}")) }
-                });
-            verifyJsonSerialization("{\"query\":\"SELECT 1\",\"parameters\":[" +
-                    "{\"name\":\"@p1\",\"value\":{\"a\":[1,2,3]}}" +
-                "]}",
-                new SqlQuerySpec()
-                {
-                    QueryText = "SELECT 1",
-                    Parameters = new SqlParameterCollection() { new SqlParameter("@p1", new JRaw("{\"a\":[1,2,3]}")) },
-                });
-            verifyJsonSerialization("{\"query\":\"SELECT 1\",\"parameters\":[" +
-                    "{\"name\":\"@p1\",\"value\":{\"a\":[1,2,3]}}" + 
-                "]}",
-                new SqlQuerySpec()
-                {
-                    QueryText = "SELECT 1",
-                    Parameters = new SqlParameterCollection() { new SqlParameter("@p1", new JRaw("{\"a\":[1,2,3]}")) },
-                });
 
             // Verify roundtrips
-            verifyJsonSerializationText("{\"query\":null}");
-            verifyJsonSerializationText("{\"query\":\"SELECT 1\"}");
+            verifyJsonSerializationText("{\"parameters\":[],\"query\":null}");
+            verifyJsonSerializationText("{\"parameters\":[],\"query\":\"SELECT 1\"}");
             verifyJsonSerializationText(
                 "{" +
-                    "\"query\":\"SELECT 1\"," +
                     "\"parameters\":[" +
                         "{\"name\":null,\"value\":null}" +
-                    "]" +
+                    "]," + "\"query\":\"SELECT 1\"" +
                 "}");
             verifyJsonSerializationText(
                 "{" +
-                    "\"query\":\"SELECT 1\"," +
                     "\"parameters\":[" +
                         "{\"name\":\"@p1\",\"value\":null}" +
-                    "]" +
+                    "]," + "\"query\":\"SELECT 1\"" +
                 "}");
             verifyJsonSerializationText(
                 "{" +
-                    "\"query\":\"SELECT 1\"," +
                     "\"parameters\":[" +
                         "{\"name\":\"@p1\",\"value\":true}" +
-                    "]" + 
+                    "]," + "\"query\":\"SELECT 1\"" +
                 "}");
             verifyJsonSerializationText(
                 "{" +
-                    "\"query\":\"SELECT 1\"," +
                     "\"parameters\":[" +
                         "{\"name\":\"@p1\",\"value\":false}" +
-                    "]" +
+                    "]," + "\"query\":\"SELECT 1\"" +
                 "}");
             verifyJsonSerializationText(
                 "{" +
-                    "\"query\":\"SELECT 1\"," +
                     "\"parameters\":[" +
                         "{\"name\":\"@p1\",\"value\":123}" +
-                    "]" +
+                    "]," + "\"query\":\"SELECT 1\"" +
                 "}");
             verifyJsonSerializationText(
                 "{" +
-                    "\"query\":\"SELECT 1\"," +
                     "\"parameters\":[" +
                         "{\"name\":\"@p1\",\"value\":\"abc\"}" +
-                    "]" +
-                "}");
-            verifyJsonSerializationText(
-                "{" +
-                    "\"query\":\"SELECT 1\"," +
-                    "\"parameters\":[" +
-                        "{\"name\":\"@p1\",\"value\":{\"a\":[1,2,\"abc\"]}}" +
-                    "]" +
-                "}");
-            verifyJsonSerializationText(
-                "{" +
-                    "\"query\":\"SELECT 1\"," +
-                    "\"parameters\":[" +
-                        "{\"name\":\"@p1\",\"value\":{\"a\":[1,2,\"abc\"]}}" +
-                    "]" +
+                    "]," + "\"query\":\"SELECT 1\"" +
                 "}");
         }
 
@@ -919,7 +926,215 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
             Type clientMessageHandlerType = cosmosClient.ClientContext.DocumentClient.httpClient.HttpMessageHandler.GetType();
             Assert.AreEqual(socketHandlerType, clientMessageHandlerType);
         }
-       
+
+        [TestMethod]
+        [TestCategory("MultiRegion")]
+        public async Task MultiRegionAccountTest()
+        {
+            string connectionString = TestCommon.GetMultiRegionConnectionString();
+            Assert.IsFalse(string.IsNullOrEmpty(connectionString), "Connection String Not Set");
+            using CosmosClient cosmosClient = new CosmosClient(connectionString);
+            Assert.IsNotNull(cosmosClient);
+            AccountProperties properties = await cosmosClient.ReadAccountAsync();
+            Assert.IsNotNull(properties);
+        }
+
+        [DataTestMethod]
+        [DataRow(true)]
+        [DataRow(false)]
+        [Owner("amudumba")]
+        public async Task ValidateAsyncExceptionNoSharing(bool asyncCacheExceptionNoSharing)
+        {
+            TimeoutException exception = new TimeoutException("HTTP Timeout exception", new TimeoutException("Inner exception message"));
+            TaskCompletionSource<object> blockSendingHandlers = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+            CosmosClientOptions cosmosClientOptions = new CosmosClientOptions()
+            {
+                ConsistencyLevel = Cosmos.ConsistencyLevel.Session,
+                SendingRequestEventArgs = (sender, e) =>
+                {
+                    if (e.IsHttpRequest())
+                    {
+                        string endWith = "partitionKeyRangeIds=0";
+                        if (e.HttpRequest.Method == HttpMethod.Get &&
+                            e.HttpRequest.RequestUri.OriginalString.EndsWith(endWith))
+                        {
+                            blockSendingHandlers.Task.Wait(); // block here until all enter
+                            throw exception;
+                        }
+                    }
+                },
+                EnableAsyncCacheExceptionNoSharing = asyncCacheExceptionNoSharing
+            };
+
+            Cosmos.Database db = null;
+            try
+            {
+                CosmosClient cosmosClient = TestCommon.CreateCosmosClient(clientOptions: cosmosClientOptions);
+
+                db = await cosmosClient.CreateDatabaseIfNotExistsAsync("TimeoutFaultTest");
+                Container container = await db.CreateContainerIfNotExistsAsync("TimeoutFaultContainer", "/pk");
+
+                int iterations = 3;
+                List<Task> createTasks = new();
+
+                for (int i = 0; i < iterations; i++)
+                {
+                    ToDoActivity testItem = ToDoActivity.CreateRandomToDoActivity();
+                    createTasks.Add(container.CreateItemAsync(testItem)
+                        .ContinueWith(t => {
+                            Assert.IsTrue(t.IsFaulted);
+                            if (asyncCacheExceptionNoSharing)
+                            {
+                                //asyncCacheExceptionNoSharing feature is enabled. Shallow copies of the exception will be thrown.
+                                Assert.IsFalse(Object.ReferenceEquals(t.Exception, exception), "Exception should not be the same");
+                            }
+                            else
+                            {
+                                //asyncCacheExceptionNoSharing feature is disabled. Exceptions will be thrown as is.
+                                Assert.IsTrue(Object.ReferenceEquals(t.Exception.InnerException, exception), "Exception should be the same");
+                            }
+                        }));
+                }
+
+                blockSendingHandlers.SetResult(null);
+
+                // Wait for all tasks to complete (they should all fail)
+                await Task.WhenAll(createTasks);
+            }
+            finally
+            {
+                if (db != null) await db.DeleteAsync();
+            }
+        }
+
+        [TestMethod]
+        [Owner("amudumba")]
+        public async Task CreateItemDuringTimeoutTest()
+        {
+            //Prepare
+            //Enabling aggressive timeout detection that empowers connnection health checker whih marks a channel/connection as "unhealthy" if there are a set of consecutive timeouts.
+            Environment.SetEnvironmentVariable("AZURE_COSMOS_AGGRESSIVE_TIMEOUT_DETECTION_ENABLED", "True");
+            Environment.SetEnvironmentVariable("AZURE_COSMOS_TIMEOUT_DETECTION_TIME_LIMIT_IN_SECONDS", "1");
+
+            // Enabling fault injection rule to simulate a timeout scenario.
+            string timeoutRuleId = "timeoutRule-" + Guid.NewGuid().ToString();
+            FaultInjectionRule timeoutRule = new FaultInjectionRuleBuilder(
+                id: timeoutRuleId,
+                condition:
+                    new FaultInjectionConditionBuilder()
+                        .WithOperationType(FaultInjectionOperationType.CreateItem)
+                        .Build(),
+                result:
+                    FaultInjectionResultBuilder.GetResultBuilder(FaultInjectionServerErrorType.SendDelay)
+                    .WithDelay(TimeSpan.FromSeconds(20))
+                        .Build())
+                .Build();
+
+            List<FaultInjectionRule> rules = new List<FaultInjectionRule> { timeoutRule };
+            FaultInjector faultInjector = new FaultInjector(rules);
+
+
+            CosmosClientOptions cosmosClientOptions = new CosmosClientOptions()
+            {
+                ConsistencyLevel = Cosmos.ConsistencyLevel.Session,
+                FaultInjector = faultInjector,
+                RequestTimeout = TimeSpan.FromSeconds(1)
+
+            };
+
+            Cosmos.Database db = null;
+            try
+            {
+                CosmosClient cosmosClient = TestCommon.CreateCosmosClient(clientOptions: cosmosClientOptions);
+
+                db = await cosmosClient.CreateDatabaseIfNotExistsAsync("TimeoutFaultTest");
+                Container container = await db.CreateContainerIfNotExistsAsync("TimeoutFaultContainer", "/pk");
+
+                bool isTimeoutExceptionThrown = false;
+
+                // Act.
+                // Simulate a aggressive timeout scenario by performing 3 writes which will all timeout due to fault injection rule.
+                for (int i = 0; i < 2; i++)
+                {
+                    try
+                    {
+                        ToDoActivity testItem = ToDoActivity.CreateRandomToDoActivity();
+                        await container.CreateItemAsync<ToDoActivity>(testItem);
+                    }
+                    catch (CosmosException exx)
+                    {
+                        Assert.AreEqual(HttpStatusCode.RequestTimeout, exx.StatusCode);
+                        isTimeoutExceptionThrown = true;
+                    }
+                }
+
+                Assert.IsTrue(isTimeoutExceptionThrown, "Timeout exception should be thrown for all the 3 writes due to fault injection rule.");
+
+                //Assert that the old channel that is now made unhealthy by the timeouts and a new healthy channel is available for next requests.
+
+                // Get all the channels that are under TransportClient -> ChannelDictionary -> Channels.
+                IStoreClientFactory storeClientFactAbstract = (IStoreClientFactory)cosmosClient.DocumentClient.GetType()
+                    .GetField("storeClientFactory", BindingFlags.NonPublic | BindingFlags.Instance)
+                    .GetValue(cosmosClient.DocumentClient);
+                StoreClientFactory storeClientFactory = (StoreClientFactory)storeClientFactAbstract;
+
+                TransportClient transportClient = (TransportClient)storeClientFactory.GetType()
+                                .GetField("transportClient", BindingFlags.NonPublic | BindingFlags.Instance)
+                                .GetValue(storeClientFactory);
+
+                Documents.Rntbd.TransportClient rntbdTransportClient = (Documents.Rntbd.TransportClient)transportClient;
+
+                Documents.Rntbd.ChannelDictionary channelDict = (Documents.Rntbd.ChannelDictionary)rntbdTransportClient.GetType()
+                                .GetField("channelDictionary", BindingFlags.NonPublic | BindingFlags.Instance)
+                                .GetValue(rntbdTransportClient);
+                ConcurrentDictionary<Documents.Rntbd.ServerKey, Documents.Rntbd.IChannel> allChannels = (ConcurrentDictionary<Documents.Rntbd.ServerKey, Documents.Rntbd.IChannel>)channelDict.GetType()
+                    .GetField("channels", BindingFlags.NonPublic | BindingFlags.Instance)
+                    .GetValue(channelDict);
+
+                Assert.IsTrue(allChannels.Count > 1, "There should be at least 2 channels, one healthy and one unhealthy channel.");
+
+                bool unHealthyChannelFound = false;
+                bool healthyChannelFound = false;
+                foreach (Documents.Rntbd.ServerKey ch in allChannels.Keys)
+                {
+                    Documents.Rntbd.LoadBalancingChannel lbChannel = (Documents.Rntbd.LoadBalancingChannel)allChannels[ch];
+
+                    Documents.Rntbd.LoadBalancingPartition lbPartition = (Documents.Rntbd.LoadBalancingPartition)lbChannel.GetType()
+                                            .GetField("singlePartition", BindingFlags.NonPublic | BindingFlags.Instance)
+                                            .GetValue(lbChannel);
+
+                    Assert.IsNotNull(lbPartition);
+                    List<Documents.Rntbd.LbChannelState> openChs = (List<Documents.Rntbd.LbChannelState>)lbPartition.GetType()
+                        .GetField("openChannels", BindingFlags.NonPublic | BindingFlags.Instance)
+                        .GetValue(lbPartition);
+
+                    foreach (Documents.Rntbd.LbChannelState channelState in openChs)
+                    {
+                        Documents.Rntbd.IChannel channel = (Documents.Rntbd.IChannel)channelState.GetType()
+                                            .GetField("channel", BindingFlags.NonPublic | BindingFlags.Instance)
+                                            .GetValue(channelState);
+                        if (!channelState.DeepHealthy)
+                        {
+                            unHealthyChannelFound = true;
+                        } else
+                        {
+                            healthyChannelFound = true;
+                        }
+                    }
+                }
+
+
+                Assert.IsTrue(unHealthyChannelFound, "An unhealthy Channel/Connection should have been found due to the repeated timeouts plus aggressive connection timeout policy");
+                Assert.IsTrue(healthyChannelFound, "A healthy Channel/Connection should have been found due to the timeouts causing the the old channel to be closed and new one created for future use");
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("AZURE_COSMOS_AGGRESSIVE_TIMEOUT_DETECTION_ENABLED", null);
+                Environment.SetEnvironmentVariable("AZURE_COSMOS_TIMEOUT_DETECTION_TIME_LIMIT_IN_SECONDS", null);
+                if (db != null) await db.DeleteAsync();
+            }
+        }
         public static IReadOnlyList<string> GetActiveConnections()
         {
             string testPid = Process.GetCurrentProcess().Id.ToString();
@@ -957,6 +1172,93 @@ namespace Microsoft.Azure.Cosmos.SDK.EmulatorTests
                 Assert.IsTrue(connections.Count > 0);
 
                 return connections;
+            }
+        }
+
+        private static string SerializeQuerySpecToJson(SqlQuerySpec querySpec)
+        {
+            string queryText;
+            using (MemoryStream stream = new MemoryStream())
+            {
+                new DataContractJsonSerializer(typeof(SqlQuerySpec), new[] { typeof(object[]), typeof(int[]), typeof(SqlParameterCollection) }).WriteObject(stream, querySpec);
+                queryText = Encoding.UTF8.GetString(stream.ToArray());
+            }
+
+            return queryText;
+        }
+
+        private static SqlQuerySpec DeserializeJsonToQuerySpec(string queryText)
+        {
+            SqlQuerySpec querySpec;
+            using (MemoryStream stream = new MemoryStream(Encoding.UTF8.GetBytes(queryText)))
+            {
+                querySpec = (SqlQuerySpec)new DataContractJsonSerializer(typeof(SqlQuerySpec), new[] { typeof(object[]), typeof(int[]), typeof(SqlParameterCollection) }).ReadObject(stream);
+            }
+
+            return querySpec;
+        }
+
+        /// <summary>
+        /// Tests that ReadItemAsync throws ObjectDisposedException when client is disposed.
+        /// Validates fix for GitHub Issue #5596: StoreProxy cannot be null during dispose.
+        /// </summary>
+        [TestMethod]
+        [TestCategory("Quarantine")] // Intentionally tests dispose behavior
+        public async Task ReadItemAsync_ThrowsObjectDisposedException_WhenClientDisposed()
+        {
+            // Arrange - Create client and container
+            CosmosClient client = TestCommon.CreateCosmosClient();
+            Cosmos.Database database = null;
+            Cosmos.Container container = null;
+            string testItemId = Guid.NewGuid().ToString();
+            string databaseId = "DisposedClientTestDb_" + Guid.NewGuid().ToString().Substring(0, 8);
+            string containerId = "TestContainer";
+
+            try
+            {
+                database = await client.CreateDatabaseAsync(databaseId);
+                container = await database.CreateContainerAsync(containerId, "/pk");
+
+                // Create a test item
+                dynamic testItem = new { id = testItemId, pk = "testPartition", data = "test" };
+                await container.CreateItemAsync(testItem, new Cosmos.PartitionKey("testPartition"));
+
+                // Get container reference before dispose
+                Cosmos.Container containerRef = client.GetContainer(database.Id, container.Id);
+
+                // Act - Dispose the client
+                client.Dispose();
+
+                // Assert - ReadItemAsync should throw ObjectDisposedException (or CosmosObjectDisposedException which extends it)
+                ObjectDisposedException exception = null;
+                try
+                {
+                    await containerRef.ReadItemAsync<dynamic>(testItemId, new Cosmos.PartitionKey("testPartition"));
+                    Assert.Fail("Expected ObjectDisposedException to be thrown");
+                }
+                catch (ObjectDisposedException ex)
+                {
+                    // CosmosObjectDisposedException extends ObjectDisposedException
+                    exception = ex;
+                }
+
+                Assert.IsNotNull(exception, "Expected ObjectDisposedException");
+                Assert.IsTrue(
+                    exception.Message.Contains("disposed"),
+                    $"Expected message about disposed client, got: {exception.Message}");
+            }
+            finally
+            {
+                // Cleanup with a new client
+                using CosmosClient cleanupClient = TestCommon.CreateCosmosClient();
+                try
+                {
+                    await cleanupClient.GetDatabase(databaseId).DeleteAsync();
+                }
+                catch
+                {
+                    // Ignore cleanup errors
+                }
             }
         }
     }

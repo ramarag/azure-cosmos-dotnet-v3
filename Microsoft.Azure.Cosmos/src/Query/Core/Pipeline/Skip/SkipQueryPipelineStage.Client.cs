@@ -6,6 +6,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.Skip
 {
     using System;
     using System.Collections.Generic;
+    using System.Diagnostics;
     using System.Linq;
     using System.Threading;
     using System.Threading.Tasks;
@@ -22,17 +23,15 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.Skip
         {
             private ClientSkipQueryPipelineStage(
                 IQueryPipelineStage source,
-                CancellationToken cancellationToken,
                 long skipCount)
-                : base(source, cancellationToken, skipCount)
+                : base(source, skipCount)
             {
                 // Work is done in base constructor.
             }
 
-            public static TryCatch<IQueryPipelineStage> MonadicCreate(
+            public static new TryCatch<IQueryPipelineStage> MonadicCreate(
                 int offsetCount,
                 CosmosElement continuationToken,
-                CancellationToken cancellationToken,
                 MonadicCreatePipelineStage monadicCreatePipelineStage)
             {
                 if (monadicCreatePipelineStage == null)
@@ -81,7 +80,7 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.Skip
                     sourceToken = null;
                 }
 
-                TryCatch<IQueryPipelineStage> tryCreateSource = monadicCreatePipelineStage(sourceToken, cancellationToken);
+                TryCatch<IQueryPipelineStage> tryCreateSource = monadicCreatePipelineStage(sourceToken);
                 if (tryCreateSource.Failed)
                 {
                     return tryCreateSource;
@@ -89,22 +88,21 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.Skip
 
                 IQueryPipelineStage stage = new ClientSkipQueryPipelineStage(
                     tryCreateSource.Result,
-                    cancellationToken,
                     offsetContinuationToken.Offset);
 
                 return TryCatch<IQueryPipelineStage>.FromResult(stage);
             }
 
-            public override async ValueTask<bool> MoveNextAsync(ITrace trace)
+            public override async ValueTask<bool> MoveNextAsync(ITrace trace, CancellationToken cancellationToken)
             {
-                this.cancellationToken.ThrowIfCancellationRequested();
+                cancellationToken.ThrowIfCancellationRequested();
 
                 if (trace == null)
                 {
                     throw new ArgumentNullException(nameof(trace));
                 }
 
-                if (!await this.inputStage.MoveNextAsync(trace))
+                if (!await this.inputStage.MoveNextAsync(trace, cancellationToken))
                 {
                     this.Current = default;
                     return false;
@@ -125,6 +123,8 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.Skip
                 int numberOfDocumentsSkipped = sourcePage.Documents.Count - documentsAfterSkip.Count;
                 this.skipCount -= numberOfDocumentsSkipped;
 
+                Debug.Assert(this.skipCount >= 0, $"{nameof(SkipQueryPipelineStage)} Assert!", "this.skipCount should be greater than or equal to 0");
+
                 QueryState state;
                 if ((sourcePage.State != null) && (sourcePage.DisallowContinuationTokenMessage == null))
                 {
@@ -142,11 +142,12 @@ namespace Microsoft.Azure.Cosmos.Query.Core.Pipeline.Skip
                     documents: documentsAfterSkip,
                     requestCharge: sourcePage.RequestCharge,
                     activityId: sourcePage.ActivityId,
-                    responseLengthInBytes: sourcePage.ResponseLengthInBytes,
                     cosmosQueryExecutionInfo: sourcePage.CosmosQueryExecutionInfo,
+                    distributionPlanSpec: default,
                     disallowContinuationTokenMessage: sourcePage.DisallowContinuationTokenMessage,
                     additionalHeaders: sourcePage.AdditionalHeaders,
-                    state: state);
+                    state: state,
+                    streaming: sourcePage.Streaming);
 
                 this.Current = TryCatch<QueryPage>.FromResult(queryPage);
                 return true;

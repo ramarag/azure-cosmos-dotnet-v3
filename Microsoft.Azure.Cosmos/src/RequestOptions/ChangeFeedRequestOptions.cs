@@ -37,6 +37,25 @@ namespace Microsoft.Azure.Cosmos
         }
 
         /// <summary>
+        /// Gets or sets the <see cref="ReadConsistencyStrategy"/> for the request.
+        /// </summary>
+        /// <remarks>
+        /// When set, this takes precedence over the account's default consistency level for change feed operations.
+        /// The <see cref="ReadConsistencyStrategy.GlobalStrong"/> strategy is only valid
+        /// for accounts configured with Strong consistency.
+        /// </remarks>
+#if PREVIEW
+        public
+#else
+        internal
+#endif
+        ReadConsistencyStrategy? ReadConsistencyStrategy
+        {
+            get => this.BaseReadConsistencyStrategy;
+            set => this.BaseReadConsistencyStrategy = value;
+        }
+
+        /// <summary>
         /// Fill the CosmosRequestMessage headers with the set properties
         /// </summary>
         /// <param name="request">The <see cref="RequestMessage"/></param>
@@ -78,6 +97,13 @@ namespace Microsoft.Azure.Cosmos
         internal
 #endif
         JsonSerializationFormatOptions JsonSerializationFormatOptions { get; set; }
+
+        /// <summary>
+        /// Enables printing query in Traces db.query.text attribute. By default, query is not printed.
+        /// Users have the option to enable printing parameterized or all queries, 
+        /// but has to beware that customer data may be shown when the later option is chosen. It's the user's responsibility to sanitize the queries if necessary.
+        /// </summary>
+        internal QueryTextMode QueryTextMode { get; set; } = Cosmos.QueryTextMode.None;
 
         internal ChangeFeedRequestOptions Clone()
         {

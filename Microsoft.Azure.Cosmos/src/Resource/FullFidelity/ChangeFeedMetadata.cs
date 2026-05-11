@@ -5,6 +5,9 @@
 namespace Microsoft.Azure.Cosmos
 {
     using System;
+    using System.Collections.Generic;
+    using System.Net;
+    using Microsoft.Azure.Cosmos.Resource.FullFidelity;
     using Microsoft.Azure.Documents;
     using Newtonsoft.Json;
     using Newtonsoft.Json.Converters;
@@ -16,58 +19,134 @@ namespace Microsoft.Azure.Cosmos
     public
 #else
     internal
-#endif 
-        class ChangeFeedMetadata
+#endif
+    class ChangeFeedMetadata
     {
+        private readonly static DateTime UnixEpoch = new DateTime(1970, 1, 1, 0, 0, 0, 0, DateTimeKind.Utc);
+
         /// <summary>
-        /// New instance of meta data for <see cref="ChangeFeedItemChange{T}"/> created.
+        /// The change's conflict resolution timestamp.
         /// </summary>
-        /// <param name="conflictResolutionTimestamp"></param>
-        /// <param name="lsn"></param>
-        /// <param name="operationType"></param>
-        /// <param name="previousLsn"></param>
-        public ChangeFeedMetadata(
-            DateTime conflictResolutionTimestamp,
-            long lsn,
-            ChangeFeedOperationType operationType,
-            long previousLsn)
-        {
-            this.ConflictResolutionTimestamp = conflictResolutionTimestamp;
-            this.Lsn = lsn;
-            this.OperationType = operationType;
-            this.PreviousLsn = previousLsn;
+        [System.Text.Json.Serialization.JsonIgnore]
+        [Newtonsoft.Json.JsonIgnore]
+        public DateTime ConflictResolutionTimestamp => UnixEpoch.AddSeconds(this.ConflictResolutionTimestampInSeconds);
+
+        private double conflictResolutionTimestampInSeconds;
+
+        [System.Text.Json.Serialization.JsonInclude]
+        [System.Text.Json.Serialization.JsonPropertyName(ChangeFeedMetadataFields.ConflictResolutionTimestamp)]
+        [JsonProperty(PropertyName = ChangeFeedMetadataFields.ConflictResolutionTimestamp, Required = Required.Always)]
+        internal double ConflictResolutionTimestampInSeconds 
+        { 
+            get
+            {
+                if (this.conflictResolutionTimestampInSeconds <= 0)
+                {
+                    throw new System.Text.Json.JsonException(
+                        $"{ChangeFeedMetadataFields.ConflictResolutionTimestamp} not set.");
+                }
+                return this.conflictResolutionTimestampInSeconds;
+            }
+            set
+            {
+                if (value == 0)
+                {
+                    throw new System.Text.Json.JsonException(
+                        $"{ChangeFeedMetadataFields.ConflictResolutionTimestamp} cannot be zero.");
+                }
+                this.conflictResolutionTimestampInSeconds = value;
+            }
         }
 
         /// <summary>
-        /// The conflict resolution timestamp.
+        /// The current change's logical sequence number.
         /// </summary>
-        [JsonProperty(PropertyName = "crts", NullValueHandling = NullValueHandling.Ignore)]
-        [JsonConverter(typeof(UnixDateTimeConverter))]
-        public DateTime ConflictResolutionTimestamp { get; }
+        [System.Text.Json.Serialization.JsonInclude]
+        [System.Text.Json.Serialization.JsonPropertyName(ChangeFeedMetadataFields.Lsn)]
+        [JsonProperty(PropertyName = ChangeFeedMetadataFields.Lsn, NullValueHandling = NullValueHandling.Ignore)]
+        public long Lsn { get; internal set; }
 
         /// <summary>
-        /// The current logical sequence number.
+        /// The change's feed operation type <see cref="ChangeFeedOperationType"/>.
         /// </summary>
-        [JsonProperty(PropertyName = "lsn", NullValueHandling = NullValueHandling.Ignore)]
-        public long Lsn { get; }
+        [Newtonsoft.Json.JsonConverter(typeof(StringEnumConverter))]
+        [System.Text.Json.Serialization.JsonInclude]
+        [System.Text.Json.Serialization.JsonPropertyName(ChangeFeedMetadataFields.OperationType)]
+        [System.Text.Json.Serialization.JsonConverter(typeof(System.Text.Json.Serialization.JsonStringEnumConverter))]
+        [JsonProperty(PropertyName = ChangeFeedMetadataFields.OperationType, NullValueHandling = NullValueHandling.Ignore)]
+        public ChangeFeedOperationType OperationType { get; internal set; }
 
         /// <summary>
-        /// The change feed operation type.
+        /// The previous change's logical sequence number.
         /// </summary>
-        [JsonProperty(PropertyName = "operationType")]
-        [JsonConverter(typeof(StringEnumConverter))]
-        public ChangeFeedOperationType OperationType { get; }
+        [System.Text.Json.Serialization.JsonInclude]
+        [System.Text.Json.Serialization.JsonPropertyName(ChangeFeedMetadataFields.PreviousImageLSN)]
+        [JsonProperty(PropertyName = ChangeFeedMetadataFields.PreviousImageLSN, NullValueHandling = NullValueHandling.Ignore)]
+        public long PreviousLsn { get; internal set; }
 
         /// <summary>
-        /// The previous logical sequence number.
+        /// Used to distinguish explicit deletes (e.g. via DeleteItem) from deletes caused by TTL expiration (a collection may define time-to-live policy for documents).
         /// </summary>
-        [JsonProperty(PropertyName = "previousImageLSN", NullValueHandling = NullValueHandling.Ignore)]
-        public long PreviousLsn { get; }
+        [System.Text.Json.Serialization.JsonInclude]
+        [System.Text.Json.Serialization.JsonPropertyName(ChangeFeedMetadataFields.TimeToLiveExpired)]
+        [JsonProperty(PropertyName = ChangeFeedMetadataFields.TimeToLiveExpired, NullValueHandling = NullValueHandling.Ignore)]
+        public bool IsTimeToLiveExpired { get; internal set; }
 
         /// <summary>
-        /// Used to distinquish explicit deletes (e.g. via DeleteItem) from deletes caused by TTL expiration (a collection may define time-to-live policy for documents).
+        /// Applicable for delete operations only, otherwise null.
+        /// The id of the previous item version. 
         /// </summary>
-        [JsonProperty(PropertyName = "timeToLiveExpired", NullValueHandling= NullValueHandling.Ignore)]
-        public bool IsTimeToLiveExpired { get; }
+        [System.Text.Json.Serialization.JsonInclude]
+        [System.Text.Json.Serialization.JsonPropertyName(ChangeFeedMetadataFields.Id)]
+        [JsonProperty(PropertyName = ChangeFeedMetadataFields.Id, NullValueHandling = NullValueHandling.Ignore)]
+        public string Id { get; internal set; }
+
+        /// <summary>
+        /// Applicable for delete operations only, otherwise null.
+        /// The partition key of the previous item version represented as a dictionary where the key is the partition key property name 
+        /// and the value is the partition key property value. All levels of hierarchy will be present if a hierarchical partition key (HPK) is used.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// For single partition key containers, the dictionary will contain one entry with the partition key path name (without the leading '/') 
+        /// as the key and the partition key value as the value.
+        /// </para>
+        /// <para>
+        /// For hierarchical partition key containers, the dictionary will contain multiple entries, one for each level of the hierarchy, 
+        /// as defined in the container's partition key definition.
+        /// </para>
+        /// <para>
+        /// Example for a single partition key container with partition key path "/tenantId":
+        /// <code>
+        /// {
+        ///     "tenantId": "tenant123"
+        /// }
+        /// </code>
+        /// </para>
+        /// <para>
+        /// Example for a hierarchical partition key container with partition key paths ["/tenantId", "/userId", "/sessionId"]:
+        /// <code>
+        /// {
+        ///     "tenantId": "tenant123",
+        ///     "userId": "user456",
+        ///     "sessionId": "session789"
+        /// }
+        /// </code>
+        /// </para>
+        /// <para>
+        /// The partition key values can be of different types (string, number, boolean, null) depending on the document's schema.
+        /// For example, with partition key paths ["/category", "/priority"]:
+        /// <code>
+        /// {
+        ///     "category": "electronics",
+        ///     "priority": 1
+        /// }
+        /// </code>
+        /// </para>
+        /// </remarks>
+        [System.Text.Json.Serialization.JsonInclude]
+        [System.Text.Json.Serialization.JsonPropertyName(ChangeFeedMetadataFields.PartitionKey)]
+        [JsonProperty(PropertyName = ChangeFeedMetadataFields.PartitionKey, NullValueHandling = NullValueHandling.Ignore)]
+        public Dictionary<string, object> PartitionKey { get; internal set; }
     }
 }

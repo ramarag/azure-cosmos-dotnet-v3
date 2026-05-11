@@ -29,20 +29,11 @@ namespace Microsoft.Azure.Cosmos
 
         public override string TimeoutPolicyName => HttpTimeoutPolicyDefault.Name;
 
-        public override TimeSpan MaximumRetryTimeLimit => CosmosHttpClient.GatewayRequestTimeout;
-
         public override int TotalRetryCount => this.TimeoutsAndDelays.Count;
 
         public override IEnumerator<(TimeSpan requestTimeout, TimeSpan delayForNextRequest)> GetTimeoutEnumerator()
         {
             return this.TimeoutsAndDelays.GetEnumerator();
-        }
-
-        // Assume that it is not safe to retry unless it is a get method.
-        // Create and other operations could have succeeded even though a timeout occurred.
-        public override bool IsSafeToRetry(HttpMethod httpMethod)
-        {
-            return httpMethod == HttpMethod.Get;
         }
 
         public override bool ShouldRetryBasedOnResponse(HttpMethod requestHttpMethod, HttpResponseMessage responseMessage)

@@ -40,19 +40,17 @@ namespace Microsoft.Azure.Cosmos.Encryption.Custom
         /// <returns>The object representing the deserialized stream</returns>
         public T FromStream<T>(Stream stream)
         {
-            if (stream == null)
+            ArgumentValidation.ThrowIfNull(stream);
+
+            if (typeof(Stream).IsAssignableFrom(typeof(T)) && stream is T typedStream)
             {
-                throw new ArgumentNullException(nameof(stream));
+                return typedStream;
             }
 
-            if (typeof(Stream).IsAssignableFrom(typeof(T)))
+            using (StreamReader sr = new (stream))
+            using (JsonTextReader jsonTextReader = new (sr))
             {
-                return (T)(object)stream;
-            }
-
-            using (StreamReader sr = new StreamReader(stream))
-            using (JsonTextReader jsonTextReader = new JsonTextReader(sr))
-            {
+                jsonTextReader.ArrayPool = JsonArrayPool.Instance;
                 JsonSerializer jsonSerializer = this.GetSerializer();
                 return jsonSerializer.Deserialize<T>(jsonTextReader);
             }
@@ -66,10 +64,11 @@ namespace Microsoft.Azure.Cosmos.Encryption.Custom
         /// <returns>An open readable stream containing the JSON of the serialized object</returns>
         public MemoryStream ToStream<T>(T input)
         {
-            MemoryStream streamPayload = new MemoryStream();
-            using (StreamWriter streamWriter = new StreamWriter(streamPayload, encoding: CosmosJsonDotNetSerializer.DefaultEncoding, bufferSize: 1024, leaveOpen: true))
-            using (JsonWriter writer = new JsonTextWriter(streamWriter))
+            MemoryStream streamPayload = new ();
+            using (StreamWriter streamWriter = new (streamPayload, encoding: CosmosJsonDotNetSerializer.DefaultEncoding, bufferSize: 1024, leaveOpen: true))
+            using (JsonTextWriter writer = new (streamWriter))
             {
+                writer.ArrayPool = JsonArrayPool.Instance;
                 writer.Formatting = Newtonsoft.Json.Formatting.None;
                 JsonSerializer jsonSerializer = this.GetSerializer();
                 jsonSerializer.Serialize(writer, input);
@@ -79,6 +78,41 @@ namespace Microsoft.Azure.Cosmos.Encryption.Custom
 
             streamPayload.Position = 0;
             return streamPayload;
+        }
+
+        /// <summary>
+        /// Serializes an object directly into the provided output stream (which remains open).
+        /// </summary>
+        /// <typeparam name="T">Type of object being serialized.</typeparam>
+        /// <param name="input">Object to serialize.</param>
+        /// <param name="output">Destination stream. Must be writable. The stream is not disposed by this method.</param>
+        /// <exception cref="ArgumentNullException">Thrown when <paramref name="output"/> is <c>null</c>.</exception>
+        /// <exception cref="ArgumentException">Thrown when <paramref name="output"/> is not writable.</exception>
+        /// <remarks>
+        /// <para>This method serializes the object directly to the provided stream without creating an intermediate MemoryStream,
+        /// reducing memory allocations for large objects.</para>
+        /// <para>After writing, the stream position will be at the end of the written content.
+        /// Callers are responsible for resetting the stream position if needed for subsequent reads.</para>
+        /// </remarks>
+        public void WriteToStream<T>(T input, Stream output)
+        {
+            ArgumentValidation.ThrowIfNull(output);
+
+            if (!output.CanWrite)
+            {
+                throw new ArgumentException("Output stream must be writable", nameof(output));
+            }
+
+            using (StreamWriter streamWriter = new (output, encoding: CosmosJsonDotNetSerializer.DefaultEncoding, bufferSize: 1024, leaveOpen: true))
+            using (JsonTextWriter writer = new (streamWriter))
+            {
+                writer.ArrayPool = JsonArrayPool.Instance;
+                writer.Formatting = Newtonsoft.Json.Formatting.None;
+                JsonSerializer jsonSerializer = this.GetSerializer();
+                jsonSerializer.Serialize(writer, input);
+                writer.Flush();
+                streamWriter.Flush();
+            }
         }
 
         /// <summary>

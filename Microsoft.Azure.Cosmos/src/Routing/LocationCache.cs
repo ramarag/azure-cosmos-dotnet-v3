@@ -8,10 +8,7 @@ namespace Microsoft.Azure.Cosmos.Routing
     using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Collections.ObjectModel;
-    using System.Globalization;
     using System.Linq;
-    using System.Net;
-    using global::Azure.Core;
     using Microsoft.Azure.Cosmos.Core.Trace;
     using Microsoft.Azure.Documents;
 
@@ -31,6 +28,8 @@ namespace Microsoft.Azure.Cosmos.Routing
         private readonly TimeSpan unavailableLocationsExpirationTime;
         private readonly int connectionLimit;
         private readonly ConcurrentDictionary<Uri, LocationUnavailabilityInfo> locationUnavailablityInfoByEndpoint;
+        private readonly RegionNameMapper regionNameMapper;
+        private readonly Func<bool> isPartitionLevelFailoverEnabled;
 
         private DatabaseAccountLocationsInfo locationInfo;
         private DateTime lastCacheUpdateTimestamp;
@@ -41,19 +40,22 @@ namespace Microsoft.Azure.Cosmos.Routing
             Uri defaultEndpoint,
             bool enableEndpointDiscovery,
             int connectionLimit,
-            bool useMultipleWriteLocations)
+            bool useMultipleWriteLocations,
+            Func<bool> isPartitionLevelFailoverEnabled = null)
         {
             this.locationInfo = new DatabaseAccountLocationsInfo(preferredLocations, defaultEndpoint);
             this.defaultEndpoint = defaultEndpoint;
             this.enableEndpointDiscovery = enableEndpointDiscovery;
             this.useMultipleWriteLocations = useMultipleWriteLocations;
             this.connectionLimit = connectionLimit;
+            this.isPartitionLevelFailoverEnabled = isPartitionLevelFailoverEnabled;
 
             this.lockObject = new object();
             this.locationUnavailablityInfoByEndpoint = new ConcurrentDictionary<Uri, LocationUnavailabilityInfo>();
             this.lastCacheUpdateTimestamp = DateTime.MinValue;
             this.enableMultipleWriteLocations = false;
             this.unavailableLocationsExpirationTime = TimeSpan.FromSeconds(LocationCache.DefaultUnavailableLocationsExpirationTimeInSeconds);
+            this.regionNameMapper = new RegionNameMapper();
 
 #if !(NETSTANDARD15 || NETSTANDARD16)
 #if NETSTANDARD20
@@ -102,6 +104,11 @@ namespace Microsoft.Azure.Cosmos.Routing
         }
 
         /// <summary>
+        /// Gets list of account level read endpoints.
+        /// </summary>
+        public ReadOnlyCollection<Uri> AccountReadEndpoints => this.locationInfo.AccountReadEndpoints;
+
+        /// <summary>
         /// Gets list of write endpoints ordered by
         /// 1. Preferred location
         /// 2. Endpoint availablity
@@ -122,24 +129,62 @@ namespace Microsoft.Azure.Cosmos.Routing
         }
 
         /// <summary>
-        /// Returns the location corresponding to the endpoint if location specific endpoint is provided.
-        /// For the defaultEndPoint, we will return the first available write location.
-        /// Returns null, in other cases.
+        /// Gets the list of thin client read endpoints.
         /// </summary>
-        /// <remarks>
-        /// Today we return null for defaultEndPoint if multiple write locations can be used.
-        /// This needs to be modifed to figure out proper location in such case.
-        /// </remarks>
+        public ReadOnlyCollection<Uri> ThinClientReadEndpoints
+        {
+            get
+            {
+                // Hot-path: avoid ConcurrentDictionary methods which acquire locks
+                if (DateTime.UtcNow - this.lastCacheUpdateTimestamp > this.unavailableLocationsExpirationTime
+                    && this.locationUnavailablityInfoByEndpoint.Any())
+                {
+                    this.UpdateLocationCache();
+                }
+
+                return this.locationInfo.ThinClientReadEndpoints;
+            }
+        }
+
+        /// <summary>
+        /// Gets the list of thin client write endpoints.
+        /// </summary>
+        public ReadOnlyCollection<Uri> ThinClientWriteEndpoints
+        {
+            get
+            {
+                // Hot-path: avoid ConcurrentDictionary methods which acquire locks
+                if (DateTime.UtcNow - this.lastCacheUpdateTimestamp > this.unavailableLocationsExpirationTime
+                    && this.locationUnavailablityInfoByEndpoint.Any())
+                {
+                    this.UpdateLocationCache();
+                }
+
+                return this.locationInfo.ThinClientWriteEndpoints;
+            }
+        }
+
+        public ReadOnlyCollection<string> EffectivePreferredLocations => this.locationInfo.EffectivePreferredLocations;
+
+        /// <summary>
+        /// Returns the region name corresponding to the given endpoint.
+        /// - If the endpoint matches a known write or read regional endpoint, returns that region name.
+        /// - If the endpoint is the account's default (global) endpoint and at least one write
+        ///   location is known, returns the first entry of the available write locations list.
+        ///   This applies to both single-master and multi-master accounts. Note that for multi-master
+        ///   accounts the first write location is simply the first region in the configured list,
+        ///   not necessarily the hub/primary write region.
+        /// - Otherwise, returns null.
+        /// </summary>
         public string GetLocation(Uri endpoint)
         {
             string location = this.locationInfo.AvailableWriteEndpointByLocation.FirstOrDefault(uri => uri.Value == endpoint).Key ?? this.locationInfo.AvailableReadEndpointByLocation.FirstOrDefault(uri => uri.Value == endpoint).Key;
 
-            if (location == null && endpoint == this.defaultEndpoint && !this.CanUseMultipleWriteLocations())
+            if (location == null
+                && endpoint == this.defaultEndpoint
+                && this.locationInfo.AvailableWriteLocations.Count > 0)
             {
-                if (this.locationInfo.AvailableWriteEndpointByLocation.Any())
-                {
-                    return this.locationInfo.AvailableWriteEndpointByLocation.First().Key;
-                }
+                return this.locationInfo.AvailableWriteLocations[0];
             }
 
             return location;
@@ -147,7 +192,8 @@ namespace Microsoft.Azure.Cosmos.Routing
 
         /// <summary>
         /// Set region name for a location if present in the locationcache otherwise set region name as null.
-        /// If endpoint's hostname is same as default endpoint hostname, set regionName as null.
+        /// For multi-master accounts, if endpoint's hostname is same as default endpoint hostname,
+        /// set regionName to the first available write region.
         /// </summary>
         /// <param name="endpoint"></param>
         /// <param name="regionName"></param>
@@ -161,12 +207,17 @@ namespace Microsoft.Azure.Cosmos.Routing
                     UriFormat.SafeUnescaped, 
                     StringComparison.OrdinalIgnoreCase) == 0)
             {
-                regionName = null;
-                return false;
+                // Use account-level enableMultipleWriteLocations (not CanUseMultipleWriteLocations which also
+                // requires client opt-in) because diagnostics should resolve the region regardless of whether
+                // the client uses multi-write. The default endpoint routes to the first write region server-side.
+                regionName = this.enableMultipleWriteLocations
+                    ? this.GetLocation(this.defaultEndpoint)
+                    : null;
+                return regionName != null;
             }
 
             regionName = this.GetLocation(endpoint);
-            return true;
+            return regionName != null;
         }
 
         /// <summary>
@@ -194,6 +245,8 @@ namespace Microsoft.Azure.Cosmos.Routing
             this.UpdateLocationCache(
                 databaseAccount.WritableRegions,
                 databaseAccount.ReadableRegions,
+                thinClientWriteLocations: databaseAccount.ThinClientWritableLocationsInternal,
+                thinClientReadLocations: databaseAccount.ThinClientReadableLocationsInternal,
                 preferenceList: null,
                 enableMultipleWriteLocations: databaseAccount.EnableMultipleWriteLocations);
         }
@@ -208,7 +261,7 @@ namespace Microsoft.Azure.Cosmos.Routing
                 preferenceList: preferredLocations);
         }
 
-        public bool IsMetaData(DocumentServiceRequest request)
+        public static bool IsMetaData(DocumentServiceRequest request)
         {
             return (request.OperationType != Documents.OperationType.ExecuteJavaScript && request.ResourceType == ResourceType.StoredProcedure) ||
                 request.ResourceType != ResourceType.Document;
@@ -217,9 +270,34 @@ namespace Microsoft.Azure.Cosmos.Routing
         public bool IsMultimasterMetadataWriteRequest(DocumentServiceRequest request)
         {
             return !request.IsReadOnlyRequest && this.locationInfo.AvailableWriteLocations.Count > 1
-                && this.IsMetaData(request) 
+                && LocationCache.IsMetaData(request) 
                 && this.CanUseMultipleWriteLocations();
 
+        }
+
+        /// <summary>
+        /// Gets the default endpoint of the account
+        /// </summary>
+        /// <returns>the default endpoint.</returns>
+        public Uri GetDefaultEndpoint()
+        {
+            return this.defaultEndpoint;
+        }
+
+        /// <summary>
+        /// Gets the mapping of available write region names to the respective endpoints
+        /// </summary>
+        public ReadOnlyDictionary<string, Uri> GetAvailableWriteEndpointsByLocation()
+        {
+            return this.locationInfo.AvailableWriteEndpointByLocation;
+        }
+
+        /// <summary>
+        /// Gets the mapping of available read region names to the respective endpoints
+        /// </summary>
+        public ReadOnlyDictionary<string, Uri> GetAvailableReadEndpointsByLocation()
+        {
+            return this.locationInfo.AvailableReadEndpointByLocation;
         }
 
         public Uri GetHubUri()
@@ -228,6 +306,22 @@ namespace Microsoft.Azure.Cosmos.Routing
             string writeLocation = currentLocationInfo.AvailableWriteLocations[0];
             Uri locationEndpointToRoute = currentLocationInfo.AvailableWriteEndpointByLocation[writeLocation];
             return locationEndpointToRoute;
+        }
+
+        /// <summary>
+        /// Gets available (account-level) read locations.
+        /// </summary>
+        public ReadOnlyCollection<string> GetAvailableAccountLevelReadLocations()
+        {
+            return this.locationInfo.AvailableReadLocations;
+        }
+        
+        /// <summary>
+        /// Gets available (account-level) write locations.
+        /// </summary>
+        public ReadOnlyCollection<string> GetAvailableAccountLevelWriteLocations()
+        {
+            return this.locationInfo.AvailableWriteLocations;
         }
 
         /// <summary>
@@ -276,7 +370,7 @@ namespace Microsoft.Azure.Cosmos.Routing
             }
             else
             {
-                ReadOnlyCollection<Uri> endpoints = request.OperationType.IsWriteOperation() ? this.WriteEndpoints : this.ReadEndpoints;
+                ReadOnlyCollection<Uri> endpoints = this.GetApplicableEndpoints(request, !request.OperationType.IsWriteOperation());
                 locationEndpointToRoute = endpoints[locationIndex % endpoints.Count];
             }
 
@@ -284,12 +378,146 @@ namespace Microsoft.Azure.Cosmos.Routing
             return locationEndpointToRoute;
         }
 
+        public ReadOnlyCollection<Uri> GetApplicableEndpoints(DocumentServiceRequest request, bool isReadRequest)
+        {
+            if (request.RequestContext.ExcludeRegions == null || request.RequestContext.ExcludeRegions.Count == 0)
+            {
+                return isReadRequest ? this.ReadEndpoints : this.WriteEndpoints;
+            }
+
+            DatabaseAccountLocationsInfo databaseAccountLocationsInfoSnapshot = this.locationInfo;
+
+            ReadOnlyCollection<string> effectivePreferredLocations = databaseAccountLocationsInfoSnapshot.EffectivePreferredLocations;
+
+            // For reads when PPAF is enabled, use WriteEndpoints[0] as fallback (dynamic,
+            // tracks current write region) instead of this.defaultEndpoint (static, region-agnostic,
+            // never updated after init). This aligns with UpdateLocationCache which already uses
+            // WriteEndpoints[0] as the ReadEndpoints fallback, and matches Java/Python SDK behavior.
+            Uri fallbackEndpoint = (isReadRequest && this.isPartitionLevelFailoverEnabled?.Invoke() == true)
+                ? databaseAccountLocationsInfoSnapshot.WriteEndpoints[0]
+                : this.defaultEndpoint;
+
+            return GetApplicableEndpoints(
+                isReadRequest ? databaseAccountLocationsInfoSnapshot.AvailableReadEndpointByLocation : databaseAccountLocationsInfoSnapshot.AvailableWriteEndpointByLocation,
+                effectivePreferredLocations,
+                fallbackEndpoint,
+                request.RequestContext.ExcludeRegions);
+        }
+
+        public ReadOnlyCollection<string> GetApplicableRegions(IEnumerable<string> excludeRegions, bool isReadRequest)
+        {
+            DatabaseAccountLocationsInfo databaseAccountLocationsInfoSnapshot = this.locationInfo;
+
+            ReadOnlyCollection<string> effectivePreferredLocations = this.locationInfo.EffectivePreferredLocations;
+
+            if (effectivePreferredLocations == null || effectivePreferredLocations.Count == 0)
+            {
+                throw new ArgumentException("effectivePreferredLocations cannot be null or empty!");
+            }
+
+            return GetApplicableRegions(
+                isReadRequest ? databaseAccountLocationsInfoSnapshot.AvailableReadLocations : databaseAccountLocationsInfoSnapshot.AvailableWriteLocations,
+                effectivePreferredLocations,
+                effectivePreferredLocations[0],
+                excludeRegions);
+        }
+
+        /// <summary>
+        /// Gets applicable endpoints for a request, if there are no applicable endpoints, returns the fallback endpoint
+        /// </summary>
+        /// <param name="regionNameByEndpoint"></param>
+        /// <param name="effectivePreferredLocations"></param>
+        /// <param name="fallbackEndpoint"></param>
+        /// <param name="excludeRegions"></param>
+        /// <returns>a list of applicable endpoints for a request</returns>
+        private static ReadOnlyCollection<Uri> GetApplicableEndpoints(
+            ReadOnlyDictionary<string, Uri> regionNameByEndpoint,
+            ReadOnlyCollection<string> effectivePreferredLocations,
+            Uri fallbackEndpoint,
+            IEnumerable<string> excludeRegions)
+        {
+            List<Uri> applicableEndpoints = new List<Uri>(regionNameByEndpoint.Count);
+            HashSet<string> excludeRegionsHash = excludeRegions == null ? new HashSet<string>() : new HashSet<string>(excludeRegions);
+
+            foreach (string region in effectivePreferredLocations)
+            {
+                if (excludeRegionsHash.Count > 0)
+                {
+                    if (!excludeRegionsHash.Contains(region) && regionNameByEndpoint.TryGetValue(region, out Uri endpoint))
+                    {
+                        applicableEndpoints.Add(endpoint);
+                    }
+                }
+                else
+                {
+                    if (regionNameByEndpoint.TryGetValue(region, out Uri endpoint))
+                    {
+                        applicableEndpoints.Add(endpoint);
+                    }
+                }
+            }
+
+            if (applicableEndpoints.Count == 0)
+            {
+                applicableEndpoints.Add(fallbackEndpoint);
+            }
+
+            return new ReadOnlyCollection<Uri>(applicableEndpoints);
+        }
+
+        /// <summary>
+        /// Gets applicable endpoints for a request, if there are no applicable endpoints, returns the fallback endpoint
+        /// </summary>
+        /// <param name="availableLocations"></param>
+        /// <param name="effectivePreferredLocations"></param>
+        /// <param name="fallbackRegion"></param>
+        /// <param name="excludeRegions"></param>
+        /// <returns>a list of applicable endpoints for a request</returns>
+        private static ReadOnlyCollection<string> GetApplicableRegions(
+            ReadOnlyCollection<string> availableLocations,
+            ReadOnlyCollection<string> effectivePreferredLocations,
+            string fallbackRegion,
+            IEnumerable<string> excludeRegions)
+        {
+            List<string> applicableRegions = new List<string>(availableLocations.Count);
+            HashSet<string> excludeRegionsHash = excludeRegions == null ? null : new HashSet<string>(excludeRegions);
+            
+            if (excludeRegions != null)
+            {
+                foreach (string region in effectivePreferredLocations)
+                {
+                    if (availableLocations.Contains(region)
+                        && !excludeRegionsHash.Contains(region))
+                    {
+                        applicableRegions.Add(region);
+                    }
+                }
+            }
+            else
+            {
+                foreach (string region in effectivePreferredLocations)
+                {
+                    if (availableLocations.Contains(region))
+                    {
+                        applicableRegions.Add(region);
+                    }
+                }
+            }
+
+            if (applicableRegions.Count == 0)
+            {
+                applicableRegions.Add(fallbackRegion);
+            }
+
+            return new ReadOnlyCollection<string>(applicableRegions);
+        }
+
         public bool ShouldRefreshEndpoints(out bool canRefreshInBackground)
         {
             canRefreshInBackground = true;
             DatabaseAccountLocationsInfo currentLocationInfo = this.locationInfo;
 
-            string mostPreferredLocation = currentLocationInfo.PreferredLocations.FirstOrDefault();
+            string mostPreferredLocation = currentLocationInfo.EffectivePreferredLocations.FirstOrDefault();
 
             // we should schedule refresh in background if we are unable to target the user's most preferredLocation.
             if (this.enableEndpointDiscovery)
@@ -470,6 +698,8 @@ namespace Microsoft.Azure.Cosmos.Routing
         private void UpdateLocationCache(
             IEnumerable<AccountRegion> writeLocations = null,
             IEnumerable<AccountRegion> readLocations = null,
+            IEnumerable<AccountRegion> thinClientWriteLocations = null,
+            IEnumerable<AccountRegion> thinClientReadLocations = null,
             ReadOnlyCollection<string> preferenceList = null,
             bool? enableMultipleWriteLocations = null)
         {
@@ -491,20 +721,94 @@ namespace Microsoft.Azure.Cosmos.Routing
 
                 if (readLocations != null)
                 {
-                    ReadOnlyCollection<string> availableReadLocations;
-                    nextLocationInfo.AvailableReadEndpointByLocation = this.GetEndpointByLocation(readLocations, out availableReadLocations);
+                    nextLocationInfo.AvailableReadEndpointByLocation = this.GetEndpointByLocation(
+                        readLocations,
+                        out ReadOnlyCollection<string> availableReadLocations,
+                        out ReadOnlyDictionary<Uri, string> availableReadLocationsByEndpoint);
+
                     nextLocationInfo.AvailableReadLocations = availableReadLocations;
+                    nextLocationInfo.AccountReadEndpoints = nextLocationInfo.AvailableReadEndpointByLocation.Select(x => x.Value).ToList().AsReadOnly();
+                    nextLocationInfo.AvailableReadLocationByEndpoint = availableReadLocationsByEndpoint;
                 }
 
                 if (writeLocations != null)
                 {
-                    ReadOnlyCollection<string> availableWriteLocations;
-                    nextLocationInfo.AvailableWriteEndpointByLocation = this.GetEndpointByLocation(writeLocations, out availableWriteLocations);
+                    nextLocationInfo.AvailableWriteEndpointByLocation = this.GetEndpointByLocation(
+                        writeLocations,
+                        out ReadOnlyCollection<string> availableWriteLocations,
+                        out ReadOnlyDictionary<Uri, string> availableWriteLocationsByEndpoint);
+
                     nextLocationInfo.AvailableWriteLocations = availableWriteLocations;
+                    nextLocationInfo.AvailableWriteLocationByEndpoint = availableWriteLocationsByEndpoint;
                 }
 
-                nextLocationInfo.WriteEndpoints = this.GetPreferredAvailableEndpoints(nextLocationInfo.AvailableWriteEndpointByLocation, nextLocationInfo.AvailableWriteLocations, OperationType.Write, this.defaultEndpoint);
-                nextLocationInfo.ReadEndpoints = this.GetPreferredAvailableEndpoints(nextLocationInfo.AvailableReadEndpointByLocation, nextLocationInfo.AvailableReadLocations, OperationType.Read, nextLocationInfo.WriteEndpoints[0]);
+                if (thinClientReadLocations != null && thinClientReadLocations.Count() > 0)
+                {
+                    nextLocationInfo.ThinClientReadEndpointByLocation = this.GetEndpointByLocation(
+                        thinClientReadLocations,
+                        out ReadOnlyCollection<string> thinClientAvailableReadLocations,
+                        out ReadOnlyDictionary<Uri, string> thinClientAvailableReadLocationsByEndpoint);
+
+                    nextLocationInfo.ThinClientReadLocations = thinClientAvailableReadLocations;
+                    nextLocationInfo.ThinClientReadLocationByEndpoint = thinClientAvailableReadLocationsByEndpoint;
+                }
+
+                if (thinClientWriteLocations != null && thinClientWriteLocations.Count() > 0)
+                {
+                    nextLocationInfo.ThinClientWriteEndpointByLocation = this.GetEndpointByLocation(
+                        thinClientWriteLocations,
+                        out ReadOnlyCollection<string> thinClientAvailableWriteLocations,
+                        out ReadOnlyDictionary<Uri, string> thinClientAvailableWriteLocationsByEndpoint);
+
+                    nextLocationInfo.ThinClientWriteLocations = thinClientAvailableWriteLocations;
+                    nextLocationInfo.ThinClientWriteLocationByEndpoint = thinClientAvailableWriteLocationsByEndpoint;
+                }
+
+                nextLocationInfo.WriteEndpoints = this.GetPreferredAvailableEndpoints(
+                    endpointsByLocation: nextLocationInfo.AvailableWriteEndpointByLocation,
+                    orderedLocations: nextLocationInfo.AvailableWriteLocations,
+                    expectedAvailableOperation: OperationType.Write,
+                    fallbackEndpoint: this.defaultEndpoint);
+
+                nextLocationInfo.ReadEndpoints = this.GetPreferredAvailableEndpoints(
+                    endpointsByLocation: nextLocationInfo.AvailableReadEndpointByLocation,
+                    orderedLocations: nextLocationInfo.AvailableReadLocations,
+                    expectedAvailableOperation: OperationType.Read,
+                    fallbackEndpoint: nextLocationInfo.WriteEndpoints[0]);
+
+                nextLocationInfo.EffectivePreferredLocations = nextLocationInfo.PreferredLocations;
+
+                nextLocationInfo.ThinClientWriteEndpoints = this.GetPreferredAvailableEndpoints(
+                    endpointsByLocation: nextLocationInfo.ThinClientWriteEndpointByLocation,
+                    orderedLocations: nextLocationInfo.ThinClientWriteLocations,
+                    expectedAvailableOperation: OperationType.Write,
+                    fallbackEndpoint: this.defaultEndpoint);
+
+                nextLocationInfo.ThinClientReadEndpoints = this.GetPreferredAvailableEndpoints(
+                    endpointsByLocation: nextLocationInfo.ThinClientReadEndpointByLocation,
+                    orderedLocations: nextLocationInfo.ThinClientReadLocations,
+                    expectedAvailableOperation: OperationType.Read,
+                    fallbackEndpoint: nextLocationInfo.ThinClientWriteEndpoints[0]);
+
+                if (nextLocationInfo.PreferredLocations == null || nextLocationInfo.PreferredLocations.Count == 0)
+                {
+                    if (!nextLocationInfo.AvailableReadLocationByEndpoint.TryGetValue(this.defaultEndpoint, out string regionForDefaultEndpoint))
+                    {
+                        nextLocationInfo.EffectivePreferredLocations = nextLocationInfo.AvailableReadLocations;
+                    }
+                    else
+                    {
+                        // if defaultEndpoint equals a regional endpoint - do not use account-level regions,
+                        // stick to defaultEndpoint configured for the CosmosClient instance
+                        List<string> locations = new ()
+                        {
+                            regionForDefaultEndpoint
+                        };
+
+                        nextLocationInfo.EffectivePreferredLocations = new ReadOnlyCollection<string>(locations);
+                    }
+                }
+
                 this.lastCacheUpdateTimestamp = DateTime.UtcNow;
 
                 DefaultTrace.TraceInformation("Current WriteEndpoints = ({0}) ReadEndpoints = ({1})",
@@ -532,18 +836,45 @@ namespace Microsoft.Azure.Cosmos.Routing
                     // If client can use multiple write locations, preferred locations list should be used for determining
                     // both read and write endpoints order.
 
-                    foreach (string location in currentLocationInfo.PreferredLocations)
+                    if (currentLocationInfo.PreferredLocations != null && currentLocationInfo.PreferredLocations.Count >= 1)
                     {
-                        Uri endpoint;
-                        if (endpointsByLocation.TryGetValue(location, out endpoint))
+                        foreach (string location in currentLocationInfo.PreferredLocations)
                         {
-                            if (this.IsEndpointUnavailable(endpoint, expectedAvailableOperation))
+                            if (endpointsByLocation.TryGetValue(location, out Uri endpoint))
                             {
-                                unavailableEndpoints.Add(endpoint);
+                                if (this.IsEndpointUnavailable(endpoint, expectedAvailableOperation))
+                                {
+                                    unavailableEndpoints.Add(endpoint);
+                                }
+                                else
+                                {
+                                    endpoints.Add(endpoint);
+                                }
                             }
-                            else
+                        }
+                    }
+                    else
+                    {
+                        foreach (string location in orderedLocations)
+                        {
+                            if (endpointsByLocation.TryGetValue(location, out Uri endpoint))
                             {
-                                endpoints.Add(endpoint);
+                                // if defaultEndpoint equals a regional endpoint - do not use account-level regions,
+                                // stick to defaultEndpoint configured for the CosmosClient instance
+                                if (this.defaultEndpoint.Equals(endpoint))
+                                {
+                                    endpoints = new List<Uri>();
+                                    break;
+                                }
+
+                                if (this.IsEndpointUnavailable(endpoint, expectedAvailableOperation))
+                                {
+                                    unavailableEndpoints.Add(endpoint);
+                                }
+                                else
+                                {
+                                    endpoints.Add(endpoint);
+                                }
                             }
                         }
                     }
@@ -560,9 +891,8 @@ namespace Microsoft.Azure.Cosmos.Routing
                 {
                     foreach (string location in orderedLocations)
                     {
-                        Uri endpoint;
                         if (!string.IsNullOrEmpty(location) && // location is empty during manual failover
-                            endpointsByLocation.TryGetValue(location, out endpoint))
+                            endpointsByLocation.TryGetValue(location, out Uri endpoint))
                         {
                             endpoints.Add(endpoint);
                         }
@@ -578,9 +908,11 @@ namespace Microsoft.Azure.Cosmos.Routing
             return endpoints.AsReadOnly();
         }
 
-        private ReadOnlyDictionary<string, Uri> GetEndpointByLocation(IEnumerable<AccountRegion> locations, out ReadOnlyCollection<string> orderedLocations)
+        private ReadOnlyDictionary<string, Uri> GetEndpointByLocation(IEnumerable<AccountRegion> locations, out ReadOnlyCollection<string> orderedLocations, out ReadOnlyDictionary<Uri, string> availableLocationsByEndpoint)
         {
             Dictionary<string, Uri> endpointsByLocation = new Dictionary<string, Uri>(StringComparer.OrdinalIgnoreCase);
+            Dictionary<Uri, string> mutableAvailableLocationsByEndpoint = new Dictionary<Uri, string>();
+            
             List<string> parsedLocations = new List<string>();
 
             foreach (AccountRegion location in locations)
@@ -591,6 +923,9 @@ namespace Microsoft.Azure.Cosmos.Routing
                 {
                     endpointsByLocation[location.Name] = endpoint;
                     parsedLocations.Add(location.Name);
+
+                    mutableAvailableLocationsByEndpoint[endpoint] = location.Name;
+
                     this.SetServicePointConnectionLimit(endpoint);
                 }
                 else
@@ -602,19 +937,43 @@ namespace Microsoft.Azure.Cosmos.Routing
             }
 
             orderedLocations = parsedLocations.AsReadOnly();
+            availableLocationsByEndpoint = new ReadOnlyDictionary<Uri, string>(mutableAvailableLocationsByEndpoint);
+
             return new ReadOnlyDictionary<string, Uri>(endpointsByLocation);
         }
 
-        private bool CanUseMultipleWriteLocations()
+        internal bool CanUseMultipleWriteLocations()
         {
             return this.useMultipleWriteLocations && this.enableMultipleWriteLocations;
+        }
+
+        internal Uri ResolveThinClientEndpoint(DocumentServiceRequest request, bool isReadRequest)
+        {
+            if (request.RequestContext != null && request.RequestContext.LocationEndpointToRoute != null)
+            {
+                return request.RequestContext.LocationEndpointToRoute;
+            }
+
+            DatabaseAccountLocationsInfo snapshot = this.locationInfo;
+            ReadOnlyCollection<Uri> endpoints = isReadRequest
+                ? snapshot.ThinClientReadEndpoints
+                : snapshot.ThinClientWriteEndpoints;
+
+            int locationIndex = request.RequestContext.LocationIndexToRoute.GetValueOrDefault(0);
+            Uri chosenEndpoint = endpoints[locationIndex % endpoints.Count];
+
+            request.RequestContext.RouteToLocation(chosenEndpoint);
+            return chosenEndpoint;
         }
 
         private void SetServicePointConnectionLimit(Uri endpoint)
         {
 #if !NETSTANDARD16
-            ServicePointAccessor servicePoint = ServicePointAccessor.FindServicePoint(endpoint);
-            servicePoint.ConnectionLimit = this.connectionLimit;
+            if (ServicePointAccessor.IsSupported)
+            {
+                ServicePointAccessor servicePoint = ServicePointAccessor.FindServicePoint(endpoint);
+                servicePoint.ConnectionLimit = this.connectionLimit;
+            }
 #endif
         }
 
@@ -633,8 +992,26 @@ namespace Microsoft.Azure.Cosmos.Routing
                 this.AvailableReadLocations = new List<string>().AsReadOnly();
                 this.AvailableWriteEndpointByLocation = new ReadOnlyDictionary<string, Uri>(new Dictionary<string, Uri>(StringComparer.OrdinalIgnoreCase));
                 this.AvailableReadEndpointByLocation = new ReadOnlyDictionary<string, Uri>(new Dictionary<string, Uri>(StringComparer.OrdinalIgnoreCase));
+                this.AvailableWriteLocationByEndpoint = new ReadOnlyDictionary<Uri, string>(new Dictionary<Uri, string>());
+                this.AvailableReadLocationByEndpoint = new ReadOnlyDictionary<Uri, string>(new Dictionary<Uri, string>());
                 this.WriteEndpoints = new List<Uri>() { defaultEndpoint }.AsReadOnly();
+                this.AccountReadEndpoints = new List<Uri>() { defaultEndpoint }.AsReadOnly();
                 this.ReadEndpoints = new List<Uri>() { defaultEndpoint }.AsReadOnly();
+                this.EffectivePreferredLocations = new List<string>().AsReadOnly();
+                
+                this.ThinClientWriteLocations = new List<string>().AsReadOnly();
+                this.ThinClientReadLocations = new List<string>().AsReadOnly();
+                this.ThinClientWriteEndpointByLocation =
+                    new ReadOnlyDictionary<string, Uri>(new Dictionary<string, Uri>());
+                this.ThinClientReadEndpointByLocation =
+                    new ReadOnlyDictionary<string, Uri>(new Dictionary<string, Uri>());
+                this.ThinClientWriteLocationByEndpoint =
+                    new ReadOnlyDictionary<Uri, string>(new Dictionary<Uri, string>());
+                this.ThinClientReadLocationByEndpoint =
+                    new ReadOnlyDictionary<Uri, string>(new Dictionary<Uri, string>());
+                this.ThinClientWriteEndpoints = new List<Uri>() { defaultEndpoint }.AsReadOnly();
+                this.ThinClientReadEndpoints = new List<Uri>() { defaultEndpoint }.AsReadOnly();
+
             }
 
             public DatabaseAccountLocationsInfo(DatabaseAccountLocationsInfo other)
@@ -644,8 +1021,21 @@ namespace Microsoft.Azure.Cosmos.Routing
                 this.AvailableReadLocations = other.AvailableReadLocations;
                 this.AvailableWriteEndpointByLocation = other.AvailableWriteEndpointByLocation;
                 this.AvailableReadEndpointByLocation = other.AvailableReadEndpointByLocation;
+                this.AvailableReadLocationByEndpoint = other.AvailableReadLocationByEndpoint;
+                this.AvailableWriteLocationByEndpoint = other.AvailableWriteLocationByEndpoint;
                 this.WriteEndpoints = other.WriteEndpoints;
+                this.AccountReadEndpoints = other.AccountReadEndpoints;
                 this.ReadEndpoints = other.ReadEndpoints;
+                this.EffectivePreferredLocations = other.EffectivePreferredLocations;
+                
+                this.ThinClientWriteLocations = other.ThinClientWriteLocations;
+                this.ThinClientReadLocations = other.ThinClientReadLocations;
+                this.ThinClientWriteEndpointByLocation = other.ThinClientWriteEndpointByLocation;
+                this.ThinClientReadEndpointByLocation = other.ThinClientReadEndpointByLocation;
+                this.ThinClientWriteLocationByEndpoint = other.ThinClientWriteLocationByEndpoint;
+                this.ThinClientReadLocationByEndpoint = other.ThinClientReadLocationByEndpoint;
+                this.ThinClientWriteEndpoints = other.ThinClientWriteEndpoints;
+                this.ThinClientReadEndpoints = other.ThinClientReadEndpoints;
             }
 
             public ReadOnlyCollection<string> PreferredLocations { get; set; }
@@ -653,8 +1043,23 @@ namespace Microsoft.Azure.Cosmos.Routing
             public ReadOnlyCollection<string> AvailableReadLocations { get; set; }
             public ReadOnlyDictionary<string, Uri> AvailableWriteEndpointByLocation { get; set; }
             public ReadOnlyDictionary<string, Uri> AvailableReadEndpointByLocation { get; set; }
+            public ReadOnlyDictionary<Uri, string> AvailableWriteLocationByEndpoint { get; set; }
+            public ReadOnlyDictionary<Uri, string> AvailableReadLocationByEndpoint { get; set; }
+
             public ReadOnlyCollection<Uri> WriteEndpoints { get; set; }
             public ReadOnlyCollection<Uri> ReadEndpoints { get; set; }
+            public ReadOnlyCollection<Uri> AccountReadEndpoints { get; set; }
+            public ReadOnlyCollection<string> EffectivePreferredLocations { get; set; }
+            public ReadOnlyCollection<string> ThinClientWriteLocations { get; set; }
+            public ReadOnlyDictionary<string, Uri> ThinClientWriteEndpointByLocation { get; set; }
+            public ReadOnlyDictionary<Uri, string> ThinClientWriteLocationByEndpoint { get; set; }
+            public ReadOnlyCollection<Uri> ThinClientWriteEndpoints { get; set; }
+
+            public ReadOnlyCollection<string> ThinClientReadLocations { get; set; }
+            public ReadOnlyDictionary<string, Uri> ThinClientReadEndpointByLocation { get; set; }
+            public ReadOnlyDictionary<Uri, string> ThinClientReadLocationByEndpoint { get; set; }
+            public ReadOnlyCollection<Uri> ThinClientReadEndpoints { get; set; }
+
         }
 
         [Flags]

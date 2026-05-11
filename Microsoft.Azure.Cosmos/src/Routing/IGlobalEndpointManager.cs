@@ -13,7 +13,13 @@ namespace Microsoft.Azure.Cosmos.Routing
     {
         ReadOnlyCollection<Uri> ReadEndpoints { get; }
 
+        ReadOnlyCollection<Uri> AccountReadEndpoints { get; }
+
         ReadOnlyCollection<Uri> WriteEndpoints { get; }
+
+        ReadOnlyCollection<Uri> ThinClientReadEndpoints { get; }
+
+        ReadOnlyCollection<Uri> ThinClientWriteEndpoints { get; }
 
         int PreferredLocationCount { get; }
 
@@ -30,5 +36,11 @@ namespace Microsoft.Azure.Cosmos.Routing
         void InitializeAccountPropertiesAndStartBackgroundRefresh(AccountProperties databaseAccount);
 
         Task RefreshLocationAsync(bool forceRefresh = false);
+
+        ReadOnlyDictionary<string, Uri> GetAvailableWriteEndpointsByLocation();
+
+        ReadOnlyDictionary<string, Uri> GetAvailableReadEndpointsByLocation();
+
+        bool CanSupportMultipleWriteLocations(ResourceType resourceType, OperationType operationType);
     }
 }

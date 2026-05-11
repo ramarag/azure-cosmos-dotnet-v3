@@ -121,11 +121,13 @@ namespace Microsoft.Azure.Cosmos.Query
             TryCatch<PartitionedQueryExecutionInfo> tryGetQueryPlan = QueryPartitionProvider.TryGetPartitionedQueryExecutionInfo(
                 querySpecJsonString: JsonConvert.SerializeObject(sqlQuerySpec),
                 partitionKeyDefinition: PartitionKeyDefinition,
+                vectorEmbeddingPolicy: null,
                 requireFormattableOrderByQuery: true,
                 isContinuationExpected: false,
                 allowNonValueAggregateQuery: true,
                 hasLogicalPartitionKey: false,
                 allowDCount: true,
+                hybridSearchSkipOrderByRewrite: false,
                 useSystemPrefix: false,
                 geospatialType: Cosmos.GeospatialType.Geography);
 

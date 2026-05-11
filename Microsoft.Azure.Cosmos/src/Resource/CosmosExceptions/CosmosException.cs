@@ -10,13 +10,14 @@ namespace Microsoft.Azure.Cosmos
     using global::Azure.Core;
     using Microsoft.Azure.Cosmos.Diagnostics;
     using Microsoft.Azure.Cosmos.Telemetry;
+    using Microsoft.Azure.Cosmos.Telemetry.Diagnostics;
     using Microsoft.Azure.Cosmos.Tracing;
     using Microsoft.Azure.Documents;
 
     /// <summary>
     /// The Cosmos Client exception
     /// </summary>
-    public class CosmosException : Exception
+    public class CosmosException : Exception, ICloneable
     {
         private readonly string stackTrace;
         private readonly Lazy<string> lazyMessage;
@@ -141,7 +142,9 @@ namespace Microsoft.Azure.Cosmos
                 }
                 else
                 {
+#pragma warning disable CDX1002 // DontUseExceptionStackTrace
                     return base.StackTrace;
+#pragma warning restore CDX1002 // DontUseExceptionStackTrace
                 }
             }
         }
@@ -178,7 +181,7 @@ namespace Microsoft.Azure.Cosmos
         {
             StringBuilder stringBuilder = new StringBuilder();
             stringBuilder.Append(this.GetType().FullName);
-            stringBuilder.Append(" : ");
+            stringBuilder.Append(": ");
 
             this.ToStringHelper(stringBuilder);
 
@@ -260,18 +263,22 @@ namespace Microsoft.Azure.Cosmos
             if (this.InnerException != null)
             {
                 stringBuilder.Append(" ---> ");
+#pragma warning disable CDX1000 // DontConvertExceptionToObject
                 stringBuilder.Append(this.InnerException);
+#pragma warning restore CDX1000 // DontConvertExceptionToObject
                 stringBuilder.AppendLine();
                 stringBuilder.Append("   ");
                 stringBuilder.Append("--- End of inner exception stack trace ---");
                 stringBuilder.AppendLine();
             }
 
+#pragma warning disable CDX1002 // DontUseExceptionStackTrace
             if (this.StackTrace != null)
             {
                 stringBuilder.Append(this.StackTrace);
                 stringBuilder.AppendLine();
             }
+#pragma warning restore CDX1002 // DontUseExceptionStackTrace
 
             if (this.Diagnostics != null)
             {
@@ -289,14 +296,28 @@ namespace Microsoft.Azure.Cosmos
         /// <param name="scope"></param>
         internal static void RecordOtelAttributes(CosmosException exception, DiagnosticScope scope)
         {
-            scope.AddAttribute(OpenTelemetryAttributeKeys.StatusCode, (int)exception.StatusCode);
-            scope.AddAttribute(OpenTelemetryAttributeKeys.SubStatusCode, (int)exception.SubStatusCode);
-            scope.AddAttribute(OpenTelemetryAttributeKeys.RequestCharge, exception.RequestCharge);
+            scope.AddIntegerAttribute(OpenTelemetryAttributeKeys.StatusCode, (int)exception.StatusCode);
+            scope.AddIntegerAttribute(OpenTelemetryAttributeKeys.SubStatusCode, (int)exception.SubStatusCode);
+            scope.AddIntegerAttribute(OpenTelemetryAttributeKeys.RequestCharge, (int)exception.RequestCharge);
             scope.AddAttribute(OpenTelemetryAttributeKeys.Region, 
                 ClientTelemetryHelper.GetContactedRegions(exception.Diagnostics?.GetContactedRegions()));
             scope.AddAttribute(OpenTelemetryAttributeKeys.ExceptionMessage, exception.Message);
 
-            CosmosDbEventSource.RecordDiagnosticsForExceptions(exception.Diagnostics);
+            if (!DiagnosticsFilterHelper.IsSuccessfulResponse(exception.StatusCode, (int)exception.SubStatusCode))
+            {
+                CosmosDbEventSource.RecordDiagnosticsForExceptions(exception.Diagnostics);
+            }
+        }
+
+        /// <summary>
+        /// Creates a shallow copy of the current exception instance.
+        /// This ensures that the cloned exception retains the same properties but does not
+        /// excessively proliferate stack traces or deep-copy unnecessary objects.
+        /// </summary>
+        /// <returns>A shallow copy of the current <see cref="CosmosException"/>.</returns>
+        public object Clone()
+        {
+            return this.MemberwiseClone();
         }
     }
 }

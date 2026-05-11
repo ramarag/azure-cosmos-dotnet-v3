@@ -268,10 +268,16 @@
     <value>Failed to deserialize response returned by server.</value>
   </data>
   <data name="StringCompareToInvalidConstant" xml:space="preserve">
-    <value>The right hand side of string.CompareTo() comparison must be constant '0'</value>
+    <value>The right-hand side of String.CompareTo() comparison must be constant '0'.</value>
+  </data>
+  <data name="StringCompareInvalidConstant" xml:space="preserve">
+    <value>The right-hand side of String.Compare() comparison must be constant '0'.</value>
   </data>
   <data name="StringCompareToInvalidOperator" xml:space="preserve">
     <value>Invalid operator for string.CompareTo(). Vaid operators are ('==', '&lt;', '&lt;=', '&gt;' or '&gt;=')</value>
+  </data>
+  <data name="StringCompareInvalidOperator" xml:space="preserve">
+    <value>Invalid operator for string.Compare(). Vaid operators are ('==', '&lt;', '&lt;=', '&gt;' or '&gt;=')</value>
   </data>
   <data name="TokenRefreshInProgress" xml:space="preserve">
     <value>Token refresh in progress.</value>
@@ -317,5 +323,8 @@
   </data>
   <data name="FeedToken_InvalidFeedTokenForContainer" xml:space="preserve">
     <value>The continuation was generated for container {0} but current container is {1}.</value>
+  </data>
+  <data name="ExtensionMethodNotImplemented" xml:space="preserve">
+    <value>Extension function can be used in LINQ expressions only and are evaluated in Azure Cosmos DB server.</value>
   </data>
 </root>

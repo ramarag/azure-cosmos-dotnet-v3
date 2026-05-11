@@ -9,13 +9,17 @@ namespace Microsoft.Azure.Cosmos.ReadFeed
     using System.Threading;
     using System.Threading.Tasks;
     using Microsoft.Azure.Cosmos.CosmosElements;
-    using Microsoft.Azure.Cosmos.Diagnostics;
+    using Microsoft.Azure.Cosmos.Json;
     using Microsoft.Azure.Cosmos.Pagination;
     using Microsoft.Azure.Cosmos.Query.Core;
+    using Microsoft.Azure.Cosmos.Query.Core.Exceptions;
     using Microsoft.Azure.Cosmos.Query.Core.Monads;
     using Microsoft.Azure.Cosmos.ReadFeed.Pagination;
+    using Microsoft.Azure.Cosmos.Resource.CosmosExceptions;
     using Microsoft.Azure.Cosmos.Routing;
+    using Microsoft.Azure.Cosmos.Telemetry.OpenTelemetry;
     using Microsoft.Azure.Cosmos.Tracing;
+    using Microsoft.Azure.Documents;
 
     /// <summary>
     /// Cosmos feed stream iterator. This is used to get the query responses with a Stream content
@@ -29,7 +33,7 @@ namespace Microsoft.Azure.Cosmos.ReadFeed
         public ReadFeedIteratorCore(
             IDocumentContainer documentContainer,
             string continuationToken,
-            ReadFeedPaginationOptions readFeedPaginationOptions,
+            ReadFeedExecutionOptions readFeedPaginationOptions,
             QueryRequestOptions queryRequestOptions,
             ContainerInternal container,
             CancellationToken cancellationToken)
@@ -37,7 +41,16 @@ namespace Microsoft.Azure.Cosmos.ReadFeed
             this.container = container;
 
             this.queryRequestOptions = queryRequestOptions;
-            readFeedPaginationOptions ??= ReadFeedPaginationOptions.Default;
+
+            this.SetupInfoForTelemetry(
+                databaseName: container?.Database?.Id,
+                operationName: OpenTelemetryConstants.Operations.ReadFeedRanges,
+                operationType: OperationType.ReadFeed,
+                querySpec: null,
+                operationMetricsOptions: queryRequestOptions?.OperationMetricsOptions,
+                networkMetricOptions: queryRequestOptions?.NetworkMetricsOptions);
+
+            readFeedPaginationOptions ??= ReadFeedExecutionOptions.Default;
 
             if (!string.IsNullOrEmpty(continuationToken))
             {
@@ -113,7 +126,27 @@ namespace Microsoft.Azure.Cosmos.ReadFeed
                             else
                             {
                                 CosmosString tokenAsString = (CosmosString)token;
-                                state = ReadFeedState.Continuation(CosmosElement.Parse(tokenAsString.Value));
+                                try
+                                {
+                                    state = ReadFeedState.Continuation(CosmosElement.Parse(tokenAsString.Value));
+                                }
+                                catch (Exception exception) when (exception.InnerException is JsonParseException)
+                                {
+                                    MalformedContinuationTokenException malformedContinuationTokenException = new MalformedContinuationTokenException(exception.Message);
+#pragma warning disable CDX1002 // DontUseExceptionStackTrace
+                                    throw CosmosExceptionFactory.CreateBadRequestException(
+                                            message: $"Malformed Continuation Token: {tokenAsString}.",
+                                            headers: CosmosQueryResponseMessageHeaders.ConvertToQueryHeaders(
+                                                new Headers(),
+                                                default,
+                                                default,
+                                                (int)SubStatusCodes.MalformedContinuationToken,
+                                                default),
+                                            stackTrace: exception.StackTrace,
+                                            innerException: malformedContinuationTokenException,
+                                            trace: null);
+#pragma warning restore CDX1002 // DontUseExceptionStackTrace
+                                }
                             }
 
                             FeedRangeState<ReadFeedState> feedRangeState = new FeedRangeState<ReadFeedState>(feedRange, state);
@@ -160,8 +193,7 @@ namespace Microsoft.Azure.Cosmos.ReadFeed
                     CrossPartitionReadFeedAsyncEnumerator.Create(
                         documentContainer,
                         new CrossFeedRangeState<ReadFeedState>(monadicReadFeedState.Result.FeedRangeStates),
-                        readFeedPaginationOptions,
-                        cancellationToken));
+                        readFeedPaginationOptions));
             }
 
             this.hasMoreResults = true;
@@ -211,12 +243,11 @@ namespace Microsoft.Azure.Cosmos.ReadFeed
             }
 
             CrossPartitionReadFeedAsyncEnumerator enumerator = this.monadicEnumerator.Result;
-            enumerator.SetCancellationToken(cancellationToken);
 
             TryCatch<CrossFeedRangePage<Pagination.ReadFeedPage, ReadFeedState>> monadicPage;
             try
             {
-                if (!await enumerator.MoveNextAsync(trace))
+                if (!await enumerator.MoveNextAsync(trace, cancellationToken))
                 {
                     throw new InvalidOperationException("Should not be calling enumerator that does not have any more results");
                 }
@@ -330,11 +361,6 @@ namespace Microsoft.Azure.Cosmos.ReadFeed
             {
                 Content = page.Content,
             };
-        }
-
-        public override CosmosElement GetCosmosElementContinuationToken()
-        {
-            throw new NotSupportedException();
         }
     }
 }

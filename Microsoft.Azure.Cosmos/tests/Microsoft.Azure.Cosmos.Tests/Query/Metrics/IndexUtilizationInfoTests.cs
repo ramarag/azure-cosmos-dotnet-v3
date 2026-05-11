@@ -5,10 +5,9 @@
 namespace Microsoft.Azure.Cosmos.Tests.Query.Metrics
 {
     using System;
-    using VisualStudio.TestTools.UnitTesting;
-    using Microsoft.Azure.Cosmos.Query.Core.Metrics;
     using System.Collections.Generic;
-    using System.Text;
+    using Microsoft.Azure.Cosmos.Query.Core.Metrics;
+    using VisualStudio.TestTools.UnitTesting;
 
     [TestClass]
     public class IndexUtilizationInfoTests
@@ -35,11 +34,11 @@ namespace Microsoft.Azure.Cosmos.Tests.Query.Metrics
         [TestMethod]
         public void TestAccumulator()
         {
-            IndexUtilizationInfo.Accumulator accumulator = new IndexUtilizationInfo.Accumulator();
-            accumulator = accumulator.Accumulate(MockIndexUtilizationInfo);
-            accumulator = accumulator.Accumulate(MockIndexUtilizationInfo);
+            IndexUtilizationInfoAccumulator accumulator = new IndexUtilizationInfoAccumulator();
+            accumulator.Accumulate(MockIndexUtilizationInfo);
+            accumulator.Accumulate(MockIndexUtilizationInfo);
 
-            IndexUtilizationInfo doubleInfo = IndexUtilizationInfo.Accumulator.ToIndexUtilizationInfo(accumulator);
+            IndexUtilizationInfo doubleInfo = accumulator.GetIndexUtilizationInfo();
             Assert.AreEqual(2 * MockIndexUtilizationInfo.PotentialSingleIndexes.Count, doubleInfo.PotentialSingleIndexes.Count);
             Assert.AreEqual(2 * MockIndexUtilizationInfo.UtilizedSingleIndexes.Count, doubleInfo.UtilizedSingleIndexes.Count);
             Assert.AreEqual(2 * MockIndexUtilizationInfo.PotentialCompositeIndexes.Count, doubleInfo.PotentialCompositeIndexes.Count);
@@ -51,7 +50,7 @@ namespace Microsoft.Azure.Cosmos.Tests.Query.Metrics
         {
             TestParses(isBase64Encoded: true);
         }
-        
+
         [TestMethod]
         public void TestTextParse()
         {
@@ -98,9 +97,7 @@ namespace Microsoft.Azure.Cosmos.Tests.Query.Metrics
                 }
                 else
                 {
-                    Assert.IsTrue(IndexUtilizationInfo.TryCreateFromDelimitedString(testString,
-                        out IndexUtilizationInfo parsedInfo));
-                    Assert.IsNotNull(parsedInfo);
+                    Assert.IsTrue(IndexMetricsInfo.TryCreateFromString(testString, out _));
                 }
             }
         }
