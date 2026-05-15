@@ -9,6 +9,7 @@ namespace Microsoft.Azure.Cosmos.Tests.Routing
     using System.Collections.ObjectModel;
     using System.Linq;
     using System.Text;
+    using Microsoft.Azure.Cosmos.Serialization.HybridRow.Schemas;
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Routing;
     using Microsoft.VisualStudio.TestTools.UnitTesting;
@@ -425,15 +426,25 @@ namespace Microsoft.Azure.Cosmos.Tests.Routing
         {
             PartitionKeyDefinition partitionKeyDefinition = new PartitionKeyDefinition();
             partitionKeyDefinition.Paths.Add("/field1");
+            partitionKeyDefinition.Paths.Add("/field2");
+            partitionKeyDefinition.Paths.Add("/field3");
             partitionKeyDefinition.Version = PartitionKeyDefinitionVersion.V2;
+            partitionKeyDefinition.Kind = PartitionKind.MultiHash;
 
-            List<string> partitionKeys = new();
+            List<Cosmos.PartitionKey> partitionKeys = new();
             //for (int i = 0; i < 100 * 100 * 100; i++)
             //{
             //    string partitionKey = $"tentant:{Guid.NewGuid()}:id";
             //    partitionKeys.Add(partitionKey);
             //}
-            partitionKeys.Add("adacct_69c5e8195b148199b533155a5de5625c");
+
+            PartitionKeyBuilder partitionKeyBuilder = new PartitionKeyBuilder();
+            partitionKeyBuilder.Add("Subscriptions")
+                .Add("DefaultPartitionKey")
+                .Add("DefaultPartitionKey");
+
+            Cosmos.PartitionKey partitionKey = partitionKeyBuilder.Build();
+            partitionKeys.Add(partitionKey);
 
             Dictionary<PartitionKeyRange, List<string>> buckets = PartitionKeyInternalTest.GetDocumentDistribution(partitionKeyDefinition, 10, partitionKeys);
 
@@ -453,13 +464,13 @@ namespace Microsoft.Azure.Cosmos.Tests.Routing
             partitionKeyDefinition.Paths.Add("/field1");
             partitionKeyDefinition.Version = PartitionKeyDefinitionVersion.V1;
 
-            List<string> partitionKeys = new List<string>();
+            List<Cosmos.PartitionKey> partitionKeys = new List<Cosmos.PartitionKey>();
             //for (int i = 0; i < 100 * 100 * 100; i++)
             //{
             //    string partitionKey = $"tentant:{Guid.NewGuid()}:id";
             //    partitionKeys.Add(partitionKey);
             //}
-            partitionKeys.Add("adacct_69c5e8195b148199b533155a5de5625c");
+            partitionKeys.Add( new Cosmos.PartitionKey("adacct_69c5e8195b148199b533155a5de5625c"));
 
             Dictionary<PartitionKeyRange, List<string>> buckets = PartitionKeyInternalTest.GetDocumentDistribution(partitionKeyDefinition, 10, partitionKeys);
 
@@ -472,12 +483,12 @@ namespace Microsoft.Azure.Cosmos.Tests.Routing
         internal static Dictionary<PartitionKeyRange, List<string>> GetDocumentDistribution(
             PartitionKeyDefinition partitionKeyDefinition,
             int PartitionCount,
-            IEnumerable<string> partitonKeys)
+            IEnumerable<Cosmos.PartitionKey> partitonKeys)
         {
             Dictionary<PartitionKeyRange, List<string>> bucket = new Dictionary<PartitionKeyRange, List<string>>();
 
             List<PartitionKeyRange> ranges = new List<PartitionKeyRange>();
-            string[] csvLines = System.IO.File.ReadAllLines(@"C:\Users\ramarag\OneDrive - Microsoft\Documents\Pkranges.csv");
+            string[] csvLines = System.IO.File.ReadAllLines(@"C:\tmp\pkranges.txt");
             // Skip header row
             for (int i = 1; i < csvLines.Length; i++)
             {
@@ -499,23 +510,22 @@ namespace Microsoft.Azure.Cosmos.Tests.Routing
             Cosmos.Routing.CollectionRoutingMap collectionRoutingMap = Cosmos.Routing.CollectionRoutingMap.TryCreateCompleteRoutingMap(
                     tuples,
                     string.Empty,
-                    true);
+                    useLengthAwareRangeComparer: true);
 
-            foreach(string partitionKey in partitonKeys)
+            foreach(Cosmos.PartitionKey partitionKey in partitonKeys)
             {
-                PartitionKeyInternal partitionKeyValue = PartitionKeyInternal.FromObjectArray(new string[] { partitionKey }, true);
-                string effectivePartitionKey = partitionKeyValue.GetEffectivePartitionKeyString(partitionKeyDefinition);
+                string effectivePartitionKey = partitionKey.InternalKey.GetEffectivePartitionKeyString(partitionKeyDefinition);
                 PartitionKeyRange partitionRange = collectionRoutingMap.GetRangeByEffectivePartitionKey(effectivePartitionKey);
 
                // int pkRangeId = int.Parse(partitionRangeId);
 
                 if (bucket.TryGetValue(partitionRange, out List<string> addedPartitionKeys))
                 {
-                    addedPartitionKeys.Add(partitionKey);
+                    addedPartitionKeys.Add(partitionKey.ToJsonString());
                 }
                 else
                 {
-                    addedPartitionKeys = new List<string>() { partitionKey };
+                    addedPartitionKeys = new List<string>() { partitionKey.ToJsonString() };
                     bucket.Add(partitionRange, addedPartitionKeys);
                 }
             }
