@@ -5,9 +5,11 @@
 namespace Microsoft.Azure.Cosmos.Tests.Routing
 {
     using System;
+    using System.Collections.Generic;
     using System.Collections.ObjectModel;
     using System.Linq;
     using System.Text;
+    using Microsoft.Azure.Cosmos.Serialization.HybridRow.Schemas;
     using Microsoft.Azure.Documents;
     using Microsoft.Azure.Documents.Routing;
     using Microsoft.VisualStudio.TestTools.UnitTesting;
@@ -414,6 +416,121 @@ namespace Microsoft.Azure.Cosmos.Tests.Routing
             //Assert.AreEqual("05C1EFAF0B1F46", middle3);
             Assert.IsTrue(StringComparer.Ordinal.Compare(middle3, PartitionKeyInternal.GetMinInclusiveEffectivePartitionKey(24, 25, partitionKey)) > 0);
             Assert.IsTrue(StringComparer.Ordinal.Compare(middle3, PartitionKeyInternal.GetMaxExclusiveEffectivePartitionKey(24, 25, partitionKey)) < 0);
+        }
+
+        /// <summary>
+        /// Tests to get distribution of data in pkranges for PartitionKeyDefinitionVersion.V2
+        /// </summary>
+        [TestMethod]
+        public void TestPartitionKeyCardinalityForV2()
+        {
+            PartitionKeyDefinition partitionKeyDefinition = new PartitionKeyDefinition();
+            partitionKeyDefinition.Paths.Add("/field1");
+            partitionKeyDefinition.Paths.Add("/field2");
+            partitionKeyDefinition.Paths.Add("/field3");
+            partitionKeyDefinition.Version = PartitionKeyDefinitionVersion.V2;
+            partitionKeyDefinition.Kind = PartitionKind.MultiHash;
+
+            List<Cosmos.PartitionKey> partitionKeys = new();
+            //for (int i = 0; i < 100 * 100 * 100; i++)
+            //{
+            //    string partitionKey = $"tentant:{Guid.NewGuid()}:id";
+            //    partitionKeys.Add(partitionKey);
+            //}
+
+            PartitionKeyBuilder partitionKeyBuilder = new PartitionKeyBuilder();
+            partitionKeyBuilder.Add("Subscriptions")
+                .Add("DefaultPartitionKey")
+                .Add("DefaultPartitionKey");
+
+            Cosmos.PartitionKey partitionKey = partitionKeyBuilder.Build();
+            partitionKeys.Add(partitionKey);
+
+            Dictionary<PartitionKeyRange, List<string>> buckets = PartitionKeyInternalTest.GetDocumentDistribution(partitionKeyDefinition, 10, partitionKeys);
+
+            foreach (List<string> addedPartitionKeys in buckets.Values)
+            {
+                Assert.IsTrue(addedPartitionKeys.Count > 0);
+            }
+        }
+
+        /// <summary>
+        /// Tests to get distribution of data in pkranges for PartitionKeyDefinitionVersion.V1
+        /// </summary>
+        [TestMethod]
+        public void TestPartitionKeyCardinalityForV1()
+        {
+            PartitionKeyDefinition partitionKeyDefinition = new PartitionKeyDefinition();
+            partitionKeyDefinition.Paths.Add("/field1");
+            partitionKeyDefinition.Version = PartitionKeyDefinitionVersion.V1;
+
+            List<Cosmos.PartitionKey> partitionKeys = new List<Cosmos.PartitionKey>();
+            //for (int i = 0; i < 100 * 100 * 100; i++)
+            //{
+            //    string partitionKey = $"tentant:{Guid.NewGuid()}:id";
+            //    partitionKeys.Add(partitionKey);
+            //}
+            partitionKeys.Add( new Cosmos.PartitionKey("adacct_69c5e8195b148199b533155a5de5625c"));
+
+            Dictionary<PartitionKeyRange, List<string>> buckets = PartitionKeyInternalTest.GetDocumentDistribution(partitionKeyDefinition, 10, partitionKeys);
+
+            foreach (List<string> addedPartitionKeys in buckets.Values)
+            {
+                Assert.IsTrue(addedPartitionKeys.Count > 0);
+            }
+        }
+
+        internal static Dictionary<PartitionKeyRange, List<string>> GetDocumentDistribution(
+            PartitionKeyDefinition partitionKeyDefinition,
+            int PartitionCount,
+            IEnumerable<Cosmos.PartitionKey> partitonKeys)
+        {
+            Dictionary<PartitionKeyRange, List<string>> bucket = new Dictionary<PartitionKeyRange, List<string>>();
+
+            List<PartitionKeyRange> ranges = new List<PartitionKeyRange>();
+            string[] csvLines = System.IO.File.ReadAllLines(@"C:\tmp\pkranges.txt");
+            // Skip header row
+            for (int i = 1; i < csvLines.Length; i++)
+            {
+                string[] columns = csvLines[i].Split(',');
+                string minInclusive = columns[1] == "0" ? "" : columns[1];
+                PartitionKeyRange partitionKeyRange = new PartitionKeyRange()
+                {
+                    Id = columns[0],
+                    MinInclusive = minInclusive,
+                    MaxExclusive = columns[2]
+                };
+                ranges.Add(partitionKeyRange);
+            }
+
+            ranges.Sort((a, b) => string.Compare(a.MinInclusive, b.MinInclusive, StringComparison.Ordinal));
+
+            IEnumerable<Tuple<PartitionKeyRange, ServiceIdentity>> tuples = ranges.Select(range => Tuple.Create(range, (ServiceIdentity)null));
+
+            Cosmos.Routing.CollectionRoutingMap collectionRoutingMap = Cosmos.Routing.CollectionRoutingMap.TryCreateCompleteRoutingMap(
+                    tuples,
+                    string.Empty,
+                    useLengthAwareRangeComparer: true);
+
+            foreach(Cosmos.PartitionKey partitionKey in partitonKeys)
+            {
+                string effectivePartitionKey = partitionKey.InternalKey.GetEffectivePartitionKeyString(partitionKeyDefinition);
+                PartitionKeyRange partitionRange = collectionRoutingMap.GetRangeByEffectivePartitionKey(effectivePartitionKey);
+
+               // int pkRangeId = int.Parse(partitionRangeId);
+
+                if (bucket.TryGetValue(partitionRange, out List<string> addedPartitionKeys))
+                {
+                    addedPartitionKeys.Add(partitionKey.ToJsonString());
+                }
+                else
+                {
+                    addedPartitionKeys = new List<string>() { partitionKey.ToJsonString() };
+                    bucket.Add(partitionRange, addedPartitionKeys);
+                }
+            }
+
+            return bucket;
         }
 
         private static void TestEffectivePartitionKeyEncoding(string buffer, int length, string expectedValue, bool v2)
